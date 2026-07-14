@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.40 — фарм + база знаний свечей/структуры графика             |
+//|  v3.50 — предикт BUY/SELL по свечам (без залипания в SELL)       |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.40"
-#property description "Фарм forex+золото + база знаний свечей (поглощение, пин, HH/HL)"
+#property version   "3.50"
+#property description "Предсказание стороны по свечам M5/M15/H1 + фарм forex/золото"
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -56,8 +56,9 @@ input bool                 InpUseSpreadFilter = true; // Фильтр спред
 input int                  InpMaxSpreadPts = 80;     // шире — золото обычно больше
 
 input group "=== База знаний (свечи) ==="
-input bool                 InpUseKnowledge = true;   // Свечи/структура для направления
-input int                  InpKnowledgeGap = 2;      // Мин. отрыв BUY vs SELL баллов
+input bool                 InpUseKnowledge = true;   // Предсказывать сторону по свечам
+input bool                 InpStickyLastDir = false; // НЕ залипать в прошлую сторону (реком. false)
+input int                  InpKnowledgeGap = 0;      // 0 = всегда берём max(BUY,SELL)
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
@@ -233,7 +234,7 @@ int OnInit()
    g_day_pnl = 0.0;
    g_trades_today = 0;
 
-   PrintFormat("ProfitScalper v3.40 KB | symbols=%d | lot=%.2f goldLot=%.2f | farm=%s | knowledge=%s",
+   PrintFormat("ProfitScalper v3.50 PREDICT | symbols=%d | lot=%.2f goldLot=%.2f | farm=%s | knowledge=%s",
                g_sym_count, InpLot, InpGoldLot,
                InpFarmLoop ? "ON" : "off",
                InpUseKnowledge ? "ON" : "off");
@@ -343,8 +344,9 @@ bool AnalyzeSymbol(const int idx, MarketScore &s)
    double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
    s.spread_pts = (ask - bid) / point;
    s.atr_pts = atr[1] / point;
-   s.trend_up = (fast[1] > slow[1] && fast[1] >= fast[2]);
-   s.trend_down = (fast[1] < slow[1] && fast[1] <= fast[2]);
+   // Мягкий тренд: положение EMA, без требования «растущей» fast
+   s.trend_up = (fast[1] > slow[1]);
+   s.trend_down = (fast[1] < slow[1]);
    return true;
   }
 
@@ -356,40 +358,38 @@ void ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
    if(InpDirection == DIR_SELL)
      { type = ORDER_TYPE_SELL; reason = "fixed SELL"; return; }
 
-   // База знаний: свечи + структура + EMA → сторона входа
+   // Главный путь: мульти-ТФ свечи → всегда конкретная сторона
    if(InpUseKnowledge)
      {
       KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
-      if(KnowledgePickDir(ks, MathMax(InpKnowledgeGap, 1), type, reason))
-         return;
-      // нет явного края — если есть тренд EMA, берём его
-      if(s.trend_up)
-        { type = ORDER_TYPE_BUY; reason = "KB flat→EMA↑ " + ks.reason; return; }
-      if(s.trend_down)
-        { type = ORDER_TYPE_SELL; reason = "KB flat→EMA↓ " + ks.reason; return; }
-      if(g_have_dir[idx])
+
+      // Если задан gap > 0 и отрыв маленький — можно учесть sticky, иначе всегда pred
+      double diff = MathAbs(ks.buy - ks.sell);
+      if(InpKnowledgeGap > 0 && diff < (double)InpKnowledgeGap && InpStickyLastDir && g_have_dir[idx])
         {
          type = g_last_dir[idx];
-         reason = "KB flat→last " + ks.reason;
+         reason = StringFormat("PRED weak→last %s (%.1f/%.1f) %s",
+                               type == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                               ks.buy, ks.sell, ks.reason);
          return;
         }
-      type = ORDER_TYPE_SELL;
-      reason = "KB flat→default SELL " + ks.reason;
+
+      KnowledgeForceDirWithTieBreak(g_syms[idx], ks, type, reason);
       return;
      }
 
+   // Без KB: только EMA, без default SELL
    if(s.trend_up)
      { type = ORDER_TYPE_BUY; reason = "trend UP"; return; }
    if(s.trend_down)
      { type = ORDER_TYPE_SELL; reason = "trend DN"; return; }
-   if(g_have_dir[idx])
-     {
-      type = g_last_dir[idx];
-      reason = "last dir";
-      return;
-     }
-   type = ORDER_TYPE_SELL;
-   reason = "default SELL";
+
+   // Нет EMA-края — микро-импульс M5
+   double imp = BodyImpulse(g_syms[idx], PERIOD_M5, 3);
+   if(imp >= 0.0)
+     { type = ORDER_TYPE_BUY; reason = "M5 impulse↑"; }
+   else
+     { type = ORDER_TYPE_SELL; reason = "M5 impulse↓"; }
   }
 
 //+------------------------------------------------------------------+
@@ -626,7 +626,7 @@ void UpdatePanel()
       list += g_syms[i] + "(" + IntegerToString(CountOurPositions(g_syms[i])) + ")";
      }
    Comment(StringFormat(
-              "ProfitScalper v3.40 KB+GOLD\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | farm=%s | KB=%s | pause=%s",
+              "ProfitScalper v3.50 PREDICT\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | farm=%s | KB=%s | pause=%s",
               list, g_day_pnl, g_trades_today, InpLot, InpGoldLot,
               InpMinProfitMoney, InpGoldMinProfit,
               InpFarmLoop ? "ON" : "off",
