@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
- //|  v3.72 — анализ свечей; конфликт EMA не зеркалит направление     |
+  //|  v3.80 — живой импульс M1/M5: куда рынок идёт СЕЙЧАС              |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.72"
-#property description "Анализ свечей H1>M15>M5. Не рандом. Конфликт EMA→ждём, не зеркалим"
+#property version   "3.80"
+#property description "Следит за живым ходом цены (M1/M5). Без «вечного» BUY/SELL. Чоп → ждёт."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -21,11 +21,11 @@ input ENUM_TRADE_DIRECTION InpDirection = DIR_AUTO;
 input double               InpLot       = 0.10;      // Лот (на графике золота = лот золота)
 input int                  InpMagic     = 26071470;
 input int                  InpDeviation = 30;
-input int                  InpMaxPositions = 5;      // Позиций
-input int                  InpBasketOpen = 5;        // Открывать за заход
-input int                  InpMaxTradesDay = 300;
+input int                  InpMaxPositions = 3;      // Позиций (меньше — меньше просадка)
+input int                  InpBasketOpen = 3;        // Открывать за заход
+input int                  InpMaxTradesDay = 200;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 200;
+input int                  InpFarmCooldownMs = 1500; // Не спамить корзинами
 input bool                 InpRefillBasket = true;
 
 input group "=== Символ ==="
@@ -63,14 +63,15 @@ input int                  InpMaxSpreadPts = 300;      // золото
 input group "=== База знаний ==="
 input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
-input bool                 InpSkipH1Conflict = true; // Слабый конфликт EMA↔свечи → ждать
-input double               InpConflictFollowGap = 8.0; // Если разрыв баллов >= этого — идём по свечам (не ждём EMA)
+input bool                 InpRequireClearFlow = true; // Только когда M1+голоса согласны
+input bool                 InpCloseAgainstFlow = true;  // Закрыть корзину если рынок развернулся
+input double               InpBasketCutLoss = 8.0;      // Резать всю корзину если суммарный минус >= $
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
-input double               InpMaxLossMoney = 150.0;
+input double               InpMaxLossMoney = 80.0;
 input bool                 InpMaxLossPct = true;
-input double               InpMaxLossPercent = 5.0;
+input double               InpMaxLossPercent = 3.0;
 
 #define MAX_SYMS 8
 
@@ -83,6 +84,7 @@ int    g_ema_slow[MAX_SYMS];
 int    g_atr[MAX_SYMS];
 ulong  g_last_farm_ms[MAX_SYMS];
 ulong  g_last_skip_ms[MAX_SYMS];
+ulong  g_pause_until_ms[MAX_SYMS];
 ENUM_ORDER_TYPE g_last_dir[MAX_SYMS];
 bool   g_have_dir[MAX_SYMS];
 double g_pred_gap[MAX_SYMS];
@@ -238,6 +240,7 @@ int OnInit()
       g_atr[i]      = iATR(g_syms[i], InpSignalTF, InpATRPeriod);
       g_last_farm_ms[i] = 0;
       g_last_skip_ms[i] = 0;
+      g_pause_until_ms[i] = 0;
       g_last_dir[i] = ORDER_TYPE_BUY;
       g_have_dir[i] = false;
       g_pred_gap[i] = 0;
@@ -265,8 +268,9 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.72 ANALYSIS | chart=%s | lot=%.2f | min$=%.2f big$=%.2f | conflict=SKIP (не зеркалим)",
-               _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney);
+   PrintFormat("ProfitScalper v3.80 FLOW | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
+               _Symbol, InpLot, InpMinProfitMoney,
+               InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss);
    return INIT_SUCCEEDED;
   }
 
@@ -287,9 +291,10 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
   {
-   // Главное: мгновенная проверка плюса по ВСЕМ символам
    if(g_trading_paused) return;
    ManageAllPositions();
+   for(int i = 0; i < g_sym_count; i++)
+      ProtectAgainstFlow(i);
    if(InpFarmLoop && g_trades_today < InpMaxTradesDay)
      {
       for(int i = 0; i < g_sym_count; i++)
@@ -316,6 +321,8 @@ void OnTick()
 
    // Сначала LOCK на каждом тике (еще быстрее реакции)
    ManageAllPositions();
+   for(int i = 0; i < g_sym_count; i++)
+      ProtectAgainstFlow(i);
 
    if(g_trades_today >= InpMaxTradesDay)
       return;
@@ -337,10 +344,31 @@ void FarmSymbol(const int idx)
    if(!AnalyzeSymbol(idx, score))
       return;
 
-   // Всегда обновляем анализ в панели даже при полной корзине
    ENUM_ORDER_TYPE type;
    string reason;
    bool can_trade = ResolveDir(idx, score, type, reason);
+
+   // Не доливаем против текущего потока (и против уже открытой стороны)
+   if(open_now > 0 && can_trade)
+     {
+      int our = -1;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+         if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+         our = (int)PositionGetInteger(POSITION_TYPE);
+         break;
+        }
+      if(our >= 0)
+        {
+         bool mismatch = ((our == POSITION_TYPE_BUY && type == ORDER_TYPE_SELL) ||
+                          (our == POSITION_TYPE_SELL && type == ORDER_TYPE_BUY));
+         if(mismatch)
+            return; // ждём ProtectAgainstFlow, не открываем хедж-бред
+        }
+     }
 
    if(!InpRefillBasket)
      {
@@ -351,6 +379,9 @@ void FarmSymbol(const int idx)
       return;
 
    if(!can_trade)
+      return;
+
+   if(g_pause_until_ms[idx] > 0 && GetTickCount64() < g_pause_until_ms[idx])
       return;
 
    if(g_last_farm_ms[idx] > 0 &&
@@ -366,7 +397,12 @@ void FarmSymbol(const int idx)
          return;
      }
 
-   int need = MathMin(InpBasketOpen, InpMaxPositions - open_now);
+   // Меньше «ковыряния»: 3 вместо агрессивной пятёрки при слабом flow
+   int basket = InpBasketOpen;
+   if(!g_pred_strong[idx])
+      basket = MathMin(basket, 3);
+
+   int need = MathMin(basket, InpMaxPositions - open_now);
    if(need <= 0)
       return;
 
@@ -449,71 +485,132 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
    if(InpDirection == DIR_SELL)
      { type = ORDER_TYPE_SELL; reason = "fixed SELL"; g_pred_side[idx]="DOWN/SELL"; return true; }
 
-   if(InpUseKnowledge)
+   MarketFlow flow = ReadMarketFlow(g_syms[idx]);
+   KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
+   g_score_buy[idx] = ks.buy;
+   g_score_sell[idx] = ks.sell;
+   g_score_why[idx] = flow.reason;
+   g_pred_gap[idx] = MathAbs(ks.buy - ks.sell);
+   type = flow.dir;
+   g_pred_side[idx] = (type == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
+
+   if(InpRequireClearFlow && !flow.clear)
      {
-      KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
-      g_score_buy[idx] = ks.buy;
-      g_score_sell[idx] = ks.sell;
-      g_score_why[idx] = ks.reason;
-
-      KnowledgeForceDirWithTieBreak(g_syms[idx], ks, type, reason);
-
-      // Конфликт: EMA H1 против баллов свечей.
-      // РАНЬШЕ зеркалили (BUY→SELL) — это давало минус при росте золота.
-      // СЕЙЧАС: не зеркалим. Либо ждём согласованности, либо идём по баллам soft.
-      bool conflict = ((type == ORDER_TYPE_SELL && s.trend_up) ||
-                       (type == ORDER_TYPE_BUY  && s.trend_down));
-
-      double diff = MathAbs(g_score_buy[idx] - g_score_sell[idx]);
-      g_pred_gap[idx] = diff;
-      g_pred_side[idx] = (type == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
-
-      if(conflict && InpSkipH1Conflict && diff < InpConflictFollowGap)
+      g_pred_strong[idx] = false;
+      g_lock_target[idx] = InpMinProfitMoney;
+      g_wait_why[idx] = StringFormat(
+         "ЖДЁМ ясный ход рынка: голоса BUY %d / SELL %d | M1=%.0fpts. Не торгуем шум.",
+         flow.buy_v, flow.sell_v, flow.m1_pts);
+      if(g_last_skip_ms[idx] == 0 ||
+         (GetTickCount64() - g_last_skip_ms[idx]) >= 5000)
         {
-         g_pred_strong[idx] = false;
-         g_lock_target[idx] = InpMinProfitMoney;
-         g_wait_why[idx] = StringFormat(
-            "ЖДЁМ: слабый сигнал (gap %.1f < %.1f) + H1-EMA против %s. Не зеркалим.",
-            diff, InpConflictFollowGap, g_pred_side[idx]);
-         if(g_last_skip_ms[idx] == 0 ||
-            (GetTickCount64() - g_last_skip_ms[idx]) >= 5000)
-           {
-            g_last_skip_ms[idx] = GetTickCount64();
-            PrintFormat("SKIP %s | %s | BUY=%.1f SELL=%.1f | %s",
-                        g_syms[idx], g_wait_why[idx],
-                        g_score_buy[idx], g_score_sell[idx], ks.reason);
-           }
-         reason = "SKIP weak-conflict " + reason;
-         return false;
+         g_last_skip_ms[idx] = GetTickCount64();
+         PrintFormat("WAIT %s | %s | %s", g_syms[idx], g_wait_why[idx], flow.reason);
         }
-
-      // Сильный перевес свечей → идём по баллам (раньше зеркалили в SELL — ошибка)
-      if(conflict)
-         reason = "FOLLOW candles (EMA soft) " + reason;
-
-      g_pred_strong[idx] = (InpSmartBigProfit && !conflict && diff >= InpStrongScoreGap);
-      g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
-      g_wait_why[idx] = "";
-
-      reason = StringFormat("%s | BUY=%.1f SELL=%.1f lock$=%.2f%s",
-                            reason, g_score_buy[idx], g_score_sell[idx],
-                            g_lock_target[idx],
-                            g_pred_strong[idx] ? " BIG" : (conflict ? " soft(H1)" : ""));
-      return true;
+      reason = "WAIT chop " + flow.reason;
+      return false;
      }
 
-   if(s.trend_up)
-     { type = ORDER_TYPE_BUY; g_pred_side[idx]="UP/BUY"; reason = "trend UP"; return true; }
-   if(s.trend_down)
-     { type = ORDER_TYPE_SELL; g_pred_side[idx]="DOWN/SELL"; reason = "trend DN"; return true; }
-
-   double imp = BodyImpulse(g_syms[idx], PERIOD_M5, 3);
-   if(imp >= 0.0)
-     { type = ORDER_TYPE_BUY; g_pred_side[idx]="UP/BUY"; reason = "M5 impulse↑"; }
-   else
-     { type = ORDER_TYPE_SELL; g_pred_side[idx]="DOWN/SELL"; reason = "M5 impulse↓"; }
-   g_lock_target[idx] = InpMinProfitMoney;
+   g_pred_strong[idx] = (InpSmartBigProfit && flow.clear &&
+                         MathAbs(flow.buy_v - flow.sell_v) >= 3 &&
+                         MathAbs(flow.m1_pts) >= 80.0);
+   g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
+   g_wait_why[idx] = "";
+   reason = StringFormat("FLOW %s B%d/S%d | BUY=%.1f SELL=%.1f lock$=%.2f%s | %s",
+                         type == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                         flow.buy_v, flow.sell_v,
+                         g_score_buy[idx], g_score_sell[idx],
+                         g_lock_target[idx],
+                         g_pred_strong[idx] ? " BIG" : "",
+                         flow.reason);
    return true;
+  }
+
+//+------------------------------------------------------------------+
+double BasketMoney(const string sym)
+  {
+   double sum = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      sum += PositionMoneyNow(ticket);
+     }
+   return sum;
+  }
+
+//+------------------------------------------------------------------+
+int CloseOurSymbol(const string sym, const string why)
+  {
+   int closed = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      if(trade.PositionClose(ticket, InpDeviation))
+         closed++;
+     }
+   if(closed > 0)
+      PrintFormat("CUT %s x%d | %s", sym, closed, why);
+   return closed;
+  }
+
+//+------------------------------------------------------------------+
+// Если рынок развернулся против открытых — режем. Не доливаем против хода.
+void ProtectAgainstFlow(const int idx)
+  {
+   const string sym = g_syms[idx];
+   int open_n = CountOurPositions(sym);
+   if(open_n <= 0)
+      return;
+
+   double basket = BasketMoney(sym);
+   if(basket <= -MathAbs(InpBasketCutLoss))
+     {
+      CloseOurSymbol(sym, StringFormat("basket loss $%.2f <= -%.2f", basket, InpBasketCutLoss));
+      g_pause_until_ms[idx] = GetTickCount64() + 12000;
+      return;
+     }
+
+   if(!InpCloseAgainstFlow)
+      return;
+
+   // Какая сторона у нас открыта?
+   int our = -1;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      our = (int)PositionGetInteger(POSITION_TYPE);
+      break;
+     }
+   if(our < 0)
+      return;
+
+   MarketFlow flow = ReadMarketFlow(sym);
+   if(!flow.clear)
+      return; // в чопе не режем агрессивно — ждём cut по $
+
+   bool against = ((our == POSITION_TYPE_BUY && flow.dir == ORDER_TYPE_SELL) ||
+                   (our == POSITION_TYPE_SELL && flow.dir == ORDER_TYPE_BUY));
+   if(!against)
+      return;
+
+   // Режем только если уже в минусе или сильный импульс против
+   if(basket < -1.0 || MathAbs(flow.m1_pts) >= 120.0)
+     {
+      CloseOurSymbol(sym, StringFormat(
+         "против потока FLOW %s B%d/S%d M1=%.0f basket=$%.2f",
+         flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
+         flow.buy_v, flow.sell_v, flow.m1_pts, basket));
+      g_pause_until_ms[idx] = GetTickCount64() + 15000;
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -811,7 +908,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.72 — анализ графика\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nТел.: вкладка Чарт + комментарий ордера BUY/SELL x>y",
+              "ProfitScalper v3.80 — куда идёт рынок СЕЙЧАС\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nЧоп/шум → ждём. Против потока → режем корзину.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }

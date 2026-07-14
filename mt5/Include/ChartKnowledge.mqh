@@ -1,87 +1,29 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
- //|  База знаний v2: непрерывный score → всегда BUY или SELL         |
- //+------------------------------------------------------------------+
+//|  v3: куда идёт РЫНОК СЕЙЧАС (M1/M5 импульс) + подтверждение M15   |
+//+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
 
-struct CandleFacts
-  {
-   double o, h, l, c;
-   double body;
-   double range;
-   double upper;
-   double lower;
-   double body_ratio;
-   double close_loc;
-   bool   bull;
-   bool   bear;
-   bool   doji;
-  };
-
 struct KnowledgeScore
   {
-   double buy;     // непрерывные баллы
+   double buy;
    double sell;
    string reason;
   };
 
-//+------------------------------------------------------------------+
-bool FillCandle(const string sym, const ENUM_TIMEFRAMES tf, const int shift, CandleFacts &f)
+struct MarketFlow
   {
-   double o[], h[], l[], c[];
-   ArraySetAsSeries(o, true);
-   ArraySetAsSeries(h, true);
-   ArraySetAsSeries(l, true);
-   ArraySetAsSeries(c, true);
-   if(CopyOpen(sym, tf, shift, 1, o) < 1) return false;
-   if(CopyHigh(sym, tf, shift, 1, h) < 1) return false;
-   if(CopyLow(sym, tf, shift, 1, l) < 1) return false;
-   if(CopyClose(sym, tf, shift, 1, c) < 1) return false;
-
-   f.o = o[0]; f.h = h[0]; f.l = l[0]; f.c = c[0];
-   f.body  = MathAbs(f.c - f.o);
-   f.range = f.h - f.l;
-   if(f.range <= 0.0)
-      f.range = MathMax(SymbolInfoDouble(sym, SYMBOL_POINT), 1e-10);
-   f.upper = f.h - MathMax(f.o, f.c);
-   f.lower = MathMin(f.o, f.c) - f.l;
-   f.body_ratio = f.body / f.range;
-   f.close_loc  = (f.c - f.l) / f.range;
-   f.bull = (f.c > f.o);
-   f.bear = (f.c < f.o);
-   f.doji = (f.body_ratio < 0.12);
-   return true;
-  }
+   int    buy_v;
+   int    sell_v;
+   double m1_pts;   // ход M1 за look-баров (со знаком)
+   double m5_pts;
+   bool   clear;    // достаточно голосов и М1 согласен
+   ENUM_ORDER_TYPE dir;
+   string reason;
+  };
 
 //+------------------------------------------------------------------+
-bool IsHammer(const CandleFacts &f)
-  {
-   return (f.lower >= 1.8 * MathMax(f.body, f.range * 0.05) &&
-           f.upper <= f.body * 1.2 && f.close_loc >= 0.55);
-  }
-
-//+------------------------------------------------------------------+
-bool IsShootingStar(const CandleFacts &f)
-  {
-   return (f.upper >= 1.8 * MathMax(f.body, f.range * 0.05) &&
-           f.lower <= f.body * 1.2 && f.close_loc <= 0.45);
-  }
-
-//+------------------------------------------------------------------+
-bool IsBullEngulf(const CandleFacts &prev, const CandleFacts &cur)
-  {
-   return (prev.bear && cur.bull && cur.c >= prev.o && cur.o <= prev.c && cur.body >= prev.body * 0.9);
-  }
-
-//+------------------------------------------------------------------+
-bool IsBearEngulf(const CandleFacts &prev, const CandleFacts &cur)
-  {
-   return (prev.bull && cur.bear && cur.c <= prev.o && cur.o >= prev.c && cur.body >= prev.body * 0.9);
-  }
-
-//+------------------------------------------------------------------+
-// Сумма тел: >0 бычий импульс, <0 медвежий (в пунктах цены)
 double BodyImpulse(const string sym, const ENUM_TIMEFRAMES tf, const int bars)
   {
    double o[], c[];
@@ -97,209 +39,142 @@ double BodyImpulse(const string sym, const ENUM_TIMEFRAMES tf, const int bars)
   }
 
 //+------------------------------------------------------------------+
-// Наклон закрытий: close[1] vs close[1+look]
 double CloseSlope(const string sym, const ENUM_TIMEFRAMES tf, const int look)
   {
    double c[];
    ArraySetAsSeries(c, true);
    int n = MathMax(look + 1, 2);
-   if(CopyClose(sym, tf, 1, n, c) < n) return 0.0;
+   // shift 0 = текущая (формирующаяся) свеча — живой рынок
+   if(CopyClose(sym, tf, 0, n, c) < n) return 0.0;
    return (c[0] - c[look]);
   }
 
 //+------------------------------------------------------------------+
-// Доля бычьих закрытых свечей среди последних n
-double BullRatio(const string sym, const ENUM_TIMEFRAMES tf, const int bars)
+double Pts(const string sym, const double price_delta)
   {
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(point <= 0.0) point = 1e-10;
+   return price_delta / point;
+  }
+
+//+------------------------------------------------------------------+
+double ATRPts(const string sym, const ENUM_TIMEFRAMES tf, const int period = 14)
+  {
+   int h = iATR(sym, tf, period);
+   if(h == INVALID_HANDLE) return 50.0;
+   double a[];
+   ArraySetAsSeries(a, true);
+   double v = 50.0;
+   if(CopyBuffer(h, 0, 1, 1, a) >= 1)
+      v = Pts(sym, a[0]);
+   IndicatorRelease(h);
+   return MathMax(v, 10.0);
+  }
+
+//+------------------------------------------------------------------+
+// Голос: +1 buy / +1 sell. thr_pts — порог в пунктах.
+void VoteSlope(const double slope_pts, const double thr,
+               int &buy_v, int &sell_v, string &why, const string tag)
+  {
+   if(slope_pts >= thr)
+     { buy_v++; why += tag + "↑ "; }
+   else if(slope_pts <= -thr)
+     { sell_v++; why += tag + "↓ "; }
+  }
+
+//+------------------------------------------------------------------+
+// Главное: куда идёт рынок прямо сейчас.
+MarketFlow ReadMarketFlow(const string sym)
+  {
+   MarketFlow f;
+   f.buy_v = 0; f.sell_v = 0;
+   f.m1_pts = 0; f.m5_pts = 0;
+   f.clear = false;
+   f.dir = ORDER_TYPE_BUY;
+   f.reason = "";
+
+   double atr_m1 = ATRPts(sym, PERIOD_M1, 14);
+   double atr_m5 = ATRPts(sym, PERIOD_M5, 14);
+   // Порог: доля ATR — чтобы не ловить шум спреда
+   double thr_m1 = MathMax(atr_m1 * 0.35, 25.0);
+   double thr_m5 = MathMax(atr_m5 * 0.25, 40.0);
+   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.20, 50.0);
+
+   f.m1_pts = Pts(sym, CloseSlope(sym, PERIOD_M1, 8));
+   f.m5_pts = Pts(sym, CloseSlope(sym, PERIOD_M5, 4));
+   double m15_pts = Pts(sym, CloseSlope(sym, PERIOD_M15, 4));
+   double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3)); // короткий импульс
+
+   VoteSlope(f.m1_pts, thr_m1, f.buy_v, f.sell_v, f.reason, "M1");
+   VoteSlope(m1_fast, thr_m1 * 0.6, f.buy_v, f.sell_v, f.reason, "M1f");
+   VoteSlope(f.m5_pts, thr_m5, f.buy_v, f.sell_v, f.reason, "M5");
+   VoteSlope(m15_pts, thr_m15, f.buy_v, f.sell_v, f.reason, "M15");
+
+   // Цена vs EMA20 на M5 (живой)
+   int ema = iMA(sym, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
+   if(ema != INVALID_HANDLE)
+     {
+      double e[];
+      ArraySetAsSeries(e, true);
+      if(CopyBuffer(ema, 0, 0, 2, e) >= 2)
+        {
+         double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+         if(bid > e[0]) { f.buy_v++; f.reason += "aboveEMA5 "; }
+         else           { f.sell_v++; f.reason += "belowEMA5 "; }
+        }
+      IndicatorRelease(ema);
+     }
+
+   // Формирующаяся M5 свеча
    double o[], c[];
    ArraySetAsSeries(o, true);
    ArraySetAsSeries(c, true);
-   int n = MathMax(bars, 2);
-   if(CopyOpen(sym, tf, 1, n, o) < n) return 0.5;
-   if(CopyClose(sym, tf, 1, n, c) < n) return 0.5;
-   int bull = 0;
-   for(int i = 0; i < n; i++)
-      if(c[i] > o[i]) bull++;
-   return (double)bull / (double)n;
+   if(CopyOpen(sym, PERIOD_M5, 0, 1, o) >= 1 && CopyClose(sym, PERIOD_M5, 0, 1, c) >= 1)
+     {
+      if(c[0] > o[0]) { f.buy_v++; f.reason += "M5now↑ "; }
+      else if(c[0] < o[0]) { f.sell_v++; f.reason += "M5now↓ "; }
+     }
+
+   f.reason += StringFormat("|M1=%.0f M5=%.0f thr1=%.0f", f.m1_pts, f.m5_pts, thr_m1);
+
+   // Чёткий сигнал: перевес голосов И короткий M1 в ту же сторону
+   if(f.buy_v >= f.sell_v + 2 && f.m1_pts > 0 && m1_fast >= 0)
+     {
+      f.dir = ORDER_TYPE_BUY;
+      f.clear = (f.buy_v >= 3);
+     }
+   else if(f.sell_v >= f.buy_v + 2 && f.m1_pts < 0 && m1_fast <= 0)
+     {
+      f.dir = ORDER_TYPE_SELL;
+      f.clear = (f.sell_v >= 3);
+     }
+   else
+     {
+      f.clear = false;
+      if(f.buy_v > f.sell_v) f.dir = ORDER_TYPE_BUY;
+      else if(f.sell_v > f.buy_v) f.dir = ORDER_TYPE_SELL;
+      else f.dir = (f.m1_pts >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      f.reason = "CHOP " + f.reason;
+     }
+
+   return f;
   }
 
 //+------------------------------------------------------------------+
-bool StructureBull(const string sym, const ENUM_TIMEFRAMES tf)
-  {
-   double h[], l[];
-   ArraySetAsSeries(h, true);
-   ArraySetAsSeries(l, true);
-   if(CopyHigh(sym, tf, 1, 8, h) < 8) return false;
-   if(CopyLow(sym, tf, 1, 8, l) < 8) return false;
-   double hh_recent = MathMax(h[0], MathMax(h[1], h[2]));
-   double hh_older  = MathMax(h[4], MathMax(h[5], h[6]));
-   double ll_recent = MathMin(l[0], MathMin(l[1], l[2]));
-   double ll_older  = MathMin(l[4], MathMin(l[5], l[6]));
-   return (hh_recent >= hh_older && ll_recent > ll_older);
-  }
-
-//+------------------------------------------------------------------+
-bool StructureBear(const string sym, const ENUM_TIMEFRAMES tf)
-  {
-   double h[], l[];
-   ArraySetAsSeries(h, true);
-   ArraySetAsSeries(l, true);
-   if(CopyHigh(sym, tf, 1, 8, h) < 8) return false;
-   if(CopyLow(sym, tf, 1, 8, l) < 8) return false;
-   double hh_recent = MathMax(h[0], MathMax(h[1], h[2]));
-   double hh_older  = MathMax(h[4], MathMax(h[5], h[6]));
-   double ll_recent = MathMin(l[0], MathMin(l[1], l[2]));
-   double ll_older  = MathMin(l[4], MathMin(l[5], l[6]));
-   return (hh_recent <= hh_older && ll_recent < ll_older);
-  }
-
-//+------------------------------------------------------------------+
-bool ThreeSoldiers(const string sym, const ENUM_TIMEFRAMES tf)
-  {
-   CandleFacts a, b, c;
-   if(!FillCandle(sym, tf, 3, a) || !FillCandle(sym, tf, 2, b) || !FillCandle(sym, tf, 1, c))
-      return false;
-   return (a.bull && b.bull && c.bull && b.c > a.c && c.c > b.c);
-  }
-
-//+------------------------------------------------------------------+
-bool ThreeCrows(const string sym, const ENUM_TIMEFRAMES tf)
-  {
-   CandleFacts a, b, c;
-   if(!FillCandle(sym, tf, 3, a) || !FillCandle(sym, tf, 2, b) || !FillCandle(sym, tf, 1, c))
-      return false;
-   return (a.bear && b.bear && c.bear && b.c < a.c && c.c < b.c);
-  }
-
-//+------------------------------------------------------------------+
-bool MorningStarLike(const string sym, const ENUM_TIMEFRAMES tf)
-  {
-   CandleFacts a, b, c;
-   if(!FillCandle(sym, tf, 3, a) || !FillCandle(sym, tf, 2, b) || !FillCandle(sym, tf, 1, c))
-      return false;
-   return (a.bear && b.body_ratio < 0.35 && c.bull && c.c > (a.o + a.c) * 0.5);
-  }
-
-//+------------------------------------------------------------------+
-bool EveningStarLike(const string sym, const ENUM_TIMEFRAMES tf)
-  {
-   CandleFacts a, b, c;
-   if(!FillCandle(sym, tf, 3, a) || !FillCandle(sym, tf, 2, b) || !FillCandle(sym, tf, 1, c))
-      return false;
-   return (a.bull && b.body_ratio < 0.35 && c.bear && c.c < (a.o + a.c) * 0.5);
-  }
-
-//+------------------------------------------------------------------+
-void AddTFVotes(const string sym, const ENUM_TIMEFRAMES tf, const string tag,
-                const double w, KnowledgeScore &s)
-  {
-   CandleFacts cur, prev;
-   if(!FillCandle(sym, tf, 1, cur) || !FillCandle(sym, tf, 2, prev))
-      return;
-
-   double body_w = (1.0 + cur.body_ratio * 2.0) * w;
-   if(cur.bull) { s.buy  += body_w; s.reason += tag + "bull "; }
-   if(cur.bear) { s.sell += body_w; s.reason += tag + "bear "; }
-
-   if(cur.close_loc >= 0.75) { s.buy  += 1.5 * w; s.reason += tag + "closeHi "; }
-   if(cur.close_loc <= 0.25) { s.sell += 1.5 * w; s.reason += tag + "closeLo "; }
-
-   double impulse = BodyImpulse(sym, tf, 5);
-   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-   if(point <= 0.0) point = 1e-10;
-   double imp_pts = impulse / point;
-   if(imp_pts > 20)  { s.buy  += MathMin(4.0, imp_pts / 40.0) * w; s.reason += tag + "imp↑ "; }
-   if(imp_pts < -20) { s.sell += MathMin(4.0, -imp_pts / 40.0) * w; s.reason += tag + "imp↓ "; }
-
-   double slope = CloseSlope(sym, tf, 4);
-   double sl_pts = slope / point;
-   if(sl_pts > 15)  { s.buy  += 1.5 * w; s.reason += tag + "slope↑ "; }
-   if(sl_pts < -15) { s.sell += 1.5 * w; s.reason += tag + "slope↓ "; }
-
-   double br = BullRatio(sym, tf, 8);
-   if(br >= 0.625) { s.buy  += 2.0 * w; s.reason += tag + "maj↑ "; }
-   if(br <= 0.375) { s.sell += 2.0 * w; s.reason += tag + "maj↓ "; }
-
-   if(IsHammer(cur))          { s.buy  += 3.0 * w; s.reason += tag + "hammer "; }
-   if(IsShootingStar(cur))    { s.sell += 3.0 * w; s.reason += tag + "star "; }
-   if(IsBullEngulf(prev, cur)){ s.buy  += 4.0 * w; s.reason += tag + "eng↑ "; }
-   if(IsBearEngulf(prev, cur)){ s.sell += 4.0 * w; s.reason += tag + "eng↓ "; }
-   if(MorningStarLike(sym, tf)){ s.buy  += 3.0 * w; s.reason += tag + "mStar "; }
-   if(EveningStarLike(sym, tf)){ s.sell += 3.0 * w; s.reason += tag + "eStar "; }
-   if(ThreeSoldiers(sym, tf)) { s.buy  += 3.5 * w; s.reason += tag + "3sol "; }
-   if(ThreeCrows(sym, tf))    { s.sell += 3.5 * w; s.reason += tag + "3crow "; }
-   if(StructureBull(sym, tf)) { s.buy  += 2.5 * w; s.reason += tag + "HHHL "; }
-   if(StructureBear(sym, tf)) { s.sell += 2.5 * w; s.reason += tag + "LHLL "; }
-  }
-
-//+------------------------------------------------------------------+
+// Оценка силы для lock / panel (совместимость)
 KnowledgeScore EvaluateKnowledge(const string sym,
-                                 const ENUM_TIMEFRAMES signal_tf,
-                                 const bool trend_up,
-                                 const bool trend_down)
+                                 const ENUM_TIMEFRAMES /*signal_tf*/,
+                                 const bool /*trend_up*/,
+                                 const bool /*trend_down*/)
   {
+   MarketFlow f = ReadMarketFlow(sym);
    KnowledgeScore s;
-   s.buy = 0; s.sell = 0; s.reason = "";
-
-   // Старший тренд важнее (иначе M5 «шум» перебивает H1)
-   if(trend_up)   { s.buy  += 8.0; s.reason += "H1-EMA↑ "; }
-   if(trend_down) { s.sell += 8.0; s.reason += "H1-EMA↓ "; }
-
-   // Вес: M5 слабый, M15 средний, H1 сильный
-   AddTFVotes(sym, PERIOD_M5,  "M5:", 0.45, s);
-   AddTFVotes(sym, signal_tf,  "M15:", 1.00, s);
-   AddTFVotes(sym, PERIOD_H1,  "H1:", 2.20, s);
-
-   double h[], l[], c[];
-   ArraySetAsSeries(h, true);
-   ArraySetAsSeries(l, true);
-   ArraySetAsSeries(c, true);
-   if(CopyHigh(sym, PERIOD_H1, 1, 20, h) >= 20 &&
-      CopyLow(sym, PERIOD_H1, 1, 20, l) >= 20 &&
-      CopyClose(sym, PERIOD_H1, 1, 1, c) >= 1)
-     {
-      double hi = h[ArrayMaximum(h, 0, 20)];
-      double lo = l[ArrayMinimum(l, 0, 20)];
-      double mid = (hi + lo) * 0.5;
-      if(c[0] > mid) { s.buy  += 4.0; s.reason += "aboveMidH1 "; }
-      else           { s.sell += 4.0; s.reason += "belowMidH1 "; }
-     }
-
-   if(s.reason == "")
-      s.reason = "neutral";
+   s.buy = (double)f.buy_v * 10.0 + MathMax(0.0, f.m1_pts) / 20.0;
+   s.sell = (double)f.sell_v * 10.0 + MathMax(0.0, -f.m1_pts) / 20.0;
+   s.reason = f.reason;
+   if(!f.clear)
+      s.reason = "WAIT " + s.reason;
    return s;
-  }
-
-//+------------------------------------------------------------------+
-// ВСЕГДА выбирает BUY или SELL — без дефолта в одну сторону.
-void KnowledgeForceDir(const KnowledgeScore &ks,
-                       ENUM_ORDER_TYPE &type,
-                       string &reason)
-  {
-   // крошечный тай-брейкер по времени — не смещать в SELL
-   double buy  = ks.buy;
-   double sell = ks.sell;
-
-   if(buy > sell)
-     {
-      type = ORDER_TYPE_BUY;
-      reason = StringFormat("PRED BUY %.1f>%.1f | %s", buy, sell, ks.reason);
-      return;
-     }
-   if(sell > buy)
-     {
-      type = ORDER_TYPE_SELL;
-      reason = StringFormat("PRED SELL %.1f>%.1f | %s", sell, buy, ks.reason);
-      return;
-     }
-
-   // Полный тай: смотрим минутный импульс — иначе BUY (не SELL!)
-   // но честнее: использовать последний закрытый тик mid change — здесь M1 body
-   // Если совсем ровно — buy как нейтральный bias вверх рынка в долгосрок FX редко нужен;
-   // правильнее чередовать? Нет — используем знак BodyImpulse M5.
-   // (передаём через reason без symbol — вызывающий ResolveDir должен передать tie-break)
-   type = ORDER_TYPE_BUY;
-   reason = StringFormat("PRED TIE→BUY %.1f=%.1f | %s", buy, sell, ks.reason);
   }
 
 //+------------------------------------------------------------------+
@@ -308,30 +183,16 @@ void KnowledgeForceDirWithTieBreak(const string sym,
                                    ENUM_ORDER_TYPE &type,
                                    string &reason)
   {
-   if(ks.buy > ks.sell + 0.05)
-     {
-      type = ORDER_TYPE_BUY;
-      reason = StringFormat("PRED BUY %.1f>%.1f | %s", ks.buy, ks.sell, ks.reason);
-      return;
-     }
-   if(ks.sell > ks.buy + 0.05)
-     {
-      type = ORDER_TYPE_SELL;
-      reason = StringFormat("PRED SELL %.1f>%.1f | %s", ks.sell, ks.buy, ks.reason);
-      return;
-     }
-
-   double imp = BodyImpulse(sym, PERIOD_M5, 3);
-   if(imp >= 0.0)
-     {
-      type = ORDER_TYPE_BUY;
-      reason = StringFormat("PRED TIE→BUY(M5imp) %.1f/%.1f | %s", ks.buy, ks.sell, ks.reason);
-     }
+   MarketFlow f = ReadMarketFlow(sym);
+   type = f.dir;
+   if(f.clear)
+      reason = StringFormat("FLOW %s B%d/S%d %s",
+                            f.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                            f.buy_v, f.sell_v, f.reason);
    else
-     {
-      type = ORDER_TYPE_SELL;
-      reason = StringFormat("PRED TIE→SELL(M5imp) %.1f/%.1f | %s", ks.buy, ks.sell, ks.reason);
-     }
+      reason = StringFormat("NOCLEAR B%d/S%d %s", f.buy_v, f.sell_v, f.reason);
+   // scores already in ks for panel
+   if(ks.buy >= 0) { /* keep */ }
   }
 
 #endif
