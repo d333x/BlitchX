@@ -1,11 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  Profit Engine v3 — вход по сильному тренду, риск %, TP/SL,      |
-//|  break-even и trailing. Без гарантий прибыли.                    |
-//+------------------------------------------------------------------+
+//|  v3.30 — фарм-цикл на нескольких символах (Forex + золото)       |
+ //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.20"
-#property description "Постоянный фарм: 5x0.1, закрыл плюс → снова открыл"
+#property version   "3.30"
+#property description "Фарм 5x0.1: forex + золото XAUUSD, закрыл плюс → снова"
 
 #include <Trade/Trade.mqh>
 
@@ -16,40 +15,30 @@ enum ENUM_TRADE_DIRECTION
    DIR_AUTO = 2
   };
 
-enum ENUM_SESSION_MODE
-  {
-   SESSION_ALL     = 0,
-   SESSION_BEST    = 1, // Лондон + NY + оверлап
-   SESSION_LONDON  = 2,
-   SESSION_NEWYORK = 3,
-   SESSION_ASIAN   = 4
-  };
-
-enum ENUM_LOT_MODE
-  {
-   LOT_FIXED = 0, // Фиксированный лот
-   LOT_RISK  = 1  // Лот от % риска на сделку
-  };
-
 input group "=== Торговля ==="
 input ENUM_TRADE_DIRECTION InpDirection = DIR_AUTO;
-input ENUM_LOT_MODE        InpLotMode   = LOT_FIXED;
-input double               InpLot       = 0.10;      // Лот (минимум 0.1)
-input double               InpRiskPercent = 1.0;     // Риск на сделку, % депозита
+input double               InpLot       = 0.10;      // Лот для валют
+input double               InpGoldLot   = 0.10;      // Лот для золота
 input int                  InpMagic     = 26071403;
 input int                  InpDeviation = 30;
-input int                  InpMaxPositions = 5;      // Сколько позиций держать одновременно
-input int                  InpBasketOpen = 5;        // Сколько открывать за один заход
-input int                  InpMaxTradesDay = 200;    // Макс. сделок за день
-input bool                 InpFarmLoop = true;       // Постоянный цикл: закрыл → снова открыл
-input int                  InpFarmCooldownMs = 800;  // Пауза перед новым заходом (мс)
+input int                  InpMaxPositions = 5;      // Позиций на ОДИН символ
+input int                  InpBasketOpen = 5;        // Открывать за заход
+input int                  InpMaxTradesDay = 300;
+input bool                 InpFarmLoop = true;
+input int                  InpFarmCooldownMs = 800;
+
+input group "=== Символы ==="
+input bool                 InpTradeChartSymbol = true;   // Торговать символ графика
+input string               InpAlsoSymbols = "XAUUSD";    // Доп. символы через запятую (золото)
+input bool                 InpPreferGoldName = true;     // Если XAUUSD нет — искать GOLD/XAU*
 
 input group "=== Фиксация прибыли ==="
-input double               InpMinProfitMoney = 0.30; // Закрыть сделку при плюсе >= $
-input bool                 InpCloseOnProfit  = true; // Закрывать сразу при плюсе
-input double               InpRewardRisk = 1.5;      // TP = SL * R (страховка)
+input double               InpMinProfitMoney = 0.30; // Плюс ($) для валют
+input double               InpGoldMinProfit  = 0.80; // Плюс ($) для золота
+input bool                 InpCloseOnProfit  = true;
+input double               InpRewardRisk = 1.5;
 input bool                 InpUseBreakEven = true;
-input double               InpBE_R       = 0.6;
+input double               InpBE_R = 0.6;
 input double               InpBE_OffsetPts = 3.0;
 input bool                 InpUseTrailing = true;
 input double               InpTrailStart_R = 0.8;
@@ -60,115 +49,178 @@ input ENUM_TIMEFRAMES      InpTrendTF   = PERIOD_H1;
 input ENUM_TIMEFRAMES      InpSignalTF  = PERIOD_M15;
 input int                  InpFastEMA   = 20;
 input int                  InpSlowEMA   = 50;
-input int                  InpRSIPeriod = 14;
-input int                  InpADXPeriod = 14;
-input double               InpMinADX    = 15.0;      // Минимальная сила тренда
-input int                  InpMinScore  = 3;
-input int                  InpScoreGap  = 1;
+input int                  InpATRPeriod = 14;
+input double               InpATR_SL_Mult = 1.8;
+input bool                 InpUseSpreadFilter = true; // Фильтр спреда
+input int                  InpMaxSpreadPts = 80;     // шире — золото обычно больше
 
-input group "=== Фильтры ==="
-input bool                 InpUseSpreadFilter = true;
-input int                  InpMaxSpreadPts    = 20;
-input int                  InpATRPeriod       = 14;
-input double               InpATR_SL_Mult     = 1.8; // Stop = ATR * mult
-input double               InpMinATRPoints    = 40.0;
-input double               InpMaxATRPoints    = 800.0;
-input bool                 InpPullbackEntry   = true; // Вход на откате к EMA
+input group "=== Защита ==="
+input bool                 InpMaxLossDay = true;
+input double               InpMaxLossMoney = 100.0;
+input bool                 InpMaxLossPct = true;
+input double               InpMaxLossPercent = 5.0;
 
-input group "=== Сессии (время сервера брокера) ==="
-input ENUM_SESSION_MODE    InpSessionMode = SESSION_ALL;
-input int                  InpLondonStart = 8;
-input int                  InpLondonEnd   = 17;
-input int                  InpNYStart     = 13;
-input int                  InpNYEnd       = 22;
-input int                  InpAsiaStart   = 0;
-input int                  InpAsiaEnd     = 9;
-
-input group "=== Защита капитала ==="
-input bool                 InpMaxLossDay   = true;
-input double               InpMaxLossMoney = 50.0;
-input bool                 InpMaxLossPct   = true;
-input double               InpMaxLossPercent = 3.0;  // Стоп дня от баланса на старт дня
-input bool                 InpCloseOnWeakTrend = true; // Выход если ADX/тренд ослаб и в минусе
+#define MAX_SYMS 8
 
 CTrade trade;
 
-int g_ema_fast_trend = INVALID_HANDLE;
-int g_ema_slow_trend = INVALID_HANDLE;
-int g_ema_fast_sig   = INVALID_HANDLE;
-int g_ema_slow_sig   = INVALID_HANDLE;
-int g_rsi_handle     = INVALID_HANDLE;
-int g_atr_handle     = INVALID_HANDLE;
-int g_adx_handle     = INVALID_HANDLE;
+string g_syms[MAX_SYMS];
+int    g_sym_count = 0;
+int    g_ema_fast[MAX_SYMS];
+int    g_ema_slow[MAX_SYMS];
+int    g_atr[MAX_SYMS];
+ulong  g_last_farm_ms[MAX_SYMS];
+ENUM_ORDER_TYPE g_last_dir[MAX_SYMS];
+bool   g_have_dir[MAX_SYMS];
 
 datetime g_day_start = 0;
 double   g_day_pnl = 0.0;
 double   g_day_start_balance = 0.0;
 bool     g_trading_paused = false;
-datetime g_last_bar_time = 0;
 int      g_trades_today = 0;
-string   g_last_skip = "";
-ulong    g_last_farm_ms = 0;
-ENUM_ORDER_TYPE g_last_farm_dir = ORDER_TYPE_SELL;
-bool     g_have_farm_dir = false;
 
 struct MarketScore
   {
-   int    buy;
-   int    sell;
-   string buy_reasons;
-   string sell_reasons;
-   double rsi;
    double atr_pts;
    double spread_pts;
-   double adx;
    bool   trend_up;
    bool   trend_down;
-   bool   session_ok;
-   string session_name;
-   double pullback_buy;  // насколько близко к EMA (0..1 качество)
-   double pullback_sell;
   };
+
+//+------------------------------------------------------------------+
+string TrimStr(string s)
+  {
+   StringTrimLeft(s);
+   StringTrimRight(s);
+   return s;
+  }
+
+//+------------------------------------------------------------------+
+bool IsGoldSymbol(const string sym)
+  {
+   string u = sym;
+   StringToUpper(u);
+   return (StringFind(u, "XAU") >= 0 || StringFind(u, "GOLD") >= 0);
+  }
+
+//+------------------------------------------------------------------+
+double LotForSymbol(const string sym)
+  {
+   return IsGoldSymbol(sym) ? InpGoldLot : InpLot;
+  }
+
+//+------------------------------------------------------------------+
+double MinProfitForSymbol(const string sym)
+  {
+   return IsGoldSymbol(sym) ? InpGoldMinProfit : InpMinProfitMoney;
+  }
+
+//+------------------------------------------------------------------+
+string ResolveGoldName()
+  {
+   // типичные имена золота у разных брокеров
+   string cands[] = {"XAUUSD", "XAUUSDm", "XAUUSD.", "GOLD", "GOLDm", "XAUUSD.a"};
+   for(int i = 0; i < ArraySize(cands); i++)
+     {
+      if(SymbolSelect(cands[i], true))
+         return cands[i];
+     }
+   // поиск по Market Watch / символам
+   int total = SymbolsTotal(false);
+   for(int i = 0; i < total; i++)
+     {
+      string name = SymbolName(i, false);
+      string u = name;
+      StringToUpper(u);
+      if(StringFind(u, "XAUUSD") >= 0 || u == "GOLD")
+        {
+         SymbolSelect(name, true);
+         return name;
+        }
+     }
+   return "";
+  }
+
+//+------------------------------------------------------------------+
+void AddSymbolUnique(const string sym)
+  {
+   if(sym == "" || g_sym_count >= MAX_SYMS)
+      return;
+   for(int i = 0; i < g_sym_count; i++)
+      if(g_syms[i] == sym)
+         return;
+   if(!SymbolSelect(sym, true))
+     {
+      PrintFormat("Символ недоступен: %s", sym);
+      return;
+     }
+   g_syms[g_sym_count++] = sym;
+  }
+
+//+------------------------------------------------------------------+
+void BuildSymbolList()
+  {
+   g_sym_count = 0;
+   if(InpTradeChartSymbol)
+      AddSymbolUnique(_Symbol);
+
+   string raw = InpAlsoSymbols;
+   string parts[];
+   int n = StringSplit(raw, ',', parts);
+   for(int i = 0; i < n; i++)
+     {
+      string s = TrimStr(parts[i]);
+      if(s == "")
+         continue;
+      string u = s;
+      StringToUpper(u);
+      if(InpPreferGoldName && (u == "XAUUSD" || u == "GOLD" || u == "XAU"))
+        {
+         string g = ResolveGoldName();
+         if(g != "")
+            AddSymbolUnique(g);
+         else
+            Print("Золото не найдено на сервере брокера");
+         continue;
+        }
+      AddSymbolUnique(s);
+     }
+
+   if(g_sym_count == 0)
+      AddSymbolUnique(_Symbol);
+  }
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   if(InpFastEMA >= InpSlowEMA)
-     {
-      Print("Fast EMA < Slow EMA требуется");
+   if(InpRewardRisk < 1.0)
       return INIT_PARAMETERS_INCORRECT;
-     }
-   if(InpRewardRisk < 1.2)
-     {
-      Print("RewardRisk слишком мал (<1.2) — стратегия будет иметь отрицательное матожидание");
-      return INIT_PARAMETERS_INCORRECT;
-     }
-   if(InpRiskPercent <= 0.0 || InpRiskPercent > 5.0)
-     {
-      Print("RiskPercent должен быть в диапазоне 0.01..5");
-      return INIT_PARAMETERS_INCORRECT;
-     }
 
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpDeviation);
-   trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetAsyncMode(false);
 
-   g_ema_fast_trend = iMA(_Symbol, InpTrendTF,  InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-   g_ema_slow_trend = iMA(_Symbol, InpTrendTF,  InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-   g_ema_fast_sig   = iMA(_Symbol, InpSignalTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-   g_ema_slow_sig   = iMA(_Symbol, InpSignalTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-   g_rsi_handle     = iRSI(_Symbol, InpSignalTF, InpRSIPeriod, PRICE_CLOSE);
-   g_atr_handle     = iATR(_Symbol, InpSignalTF, InpATRPeriod);
-   g_adx_handle     = iADX(_Symbol, InpTrendTF, InpADXPeriod);
-
-   if(g_ema_fast_trend == INVALID_HANDLE || g_ema_slow_trend == INVALID_HANDLE ||
-      g_ema_fast_sig == INVALID_HANDLE || g_ema_slow_sig == INVALID_HANDLE ||
-      g_rsi_handle == INVALID_HANDLE || g_atr_handle == INVALID_HANDLE ||
-      g_adx_handle == INVALID_HANDLE)
+   BuildSymbolList();
+   if(g_sym_count < 1)
      {
-      Print("Ошибка создания индикаторов");
+      Print("Нет символов для торговли");
       return INIT_FAILED;
+     }
+
+   for(int i = 0; i < g_sym_count; i++)
+     {
+      g_ema_fast[i] = iMA(g_syms[i], InpTrendTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+      g_ema_slow[i] = iMA(g_syms[i], InpTrendTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+      g_atr[i]      = iATR(g_syms[i], InpSignalTF, InpATRPeriod);
+      g_last_farm_ms[i] = 0;
+      g_last_dir[i] = ORDER_TYPE_SELL;
+      g_have_dir[i] = false;
+      if(g_ema_fast[i] == INVALID_HANDLE || g_ema_slow[i] == INVALID_HANDLE || g_atr[i] == INVALID_HANDLE)
+        {
+         PrintFormat("Индикаторы не созданы для %s", g_syms[i]);
+         return INIT_FAILED;
+        }
+      PrintFormat("Символ #%d: %s %s", i + 1, g_syms[i], IsGoldSymbol(g_syms[i]) ? "[GOLD]" : "");
      }
 
    g_day_start = DayStart();
@@ -176,23 +228,22 @@ int OnInit()
    g_day_pnl = 0.0;
    g_trades_today = 0;
 
-   PrintFormat("ProfitScalper v3.20 FARM | %s | lot=%.2f | basket=%d | lock>=$%.2f | loop=%s",
-               _Symbol, InpLot, InpBasketOpen, InpMinProfitMoney, InpFarmLoop ? "ON" : "off");
+   PrintFormat("ProfitScalper v3.30 MULTI | symbols=%d | lot=%.2f goldLot=%.2f | farm=%s",
+               g_sym_count, InpLot, InpGoldLot, InpFarmLoop ? "ON" : "off");
    return INIT_SUCCEEDED;
   }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   IndicatorRelease(g_ema_fast_trend);
-   IndicatorRelease(g_ema_slow_trend);
-   IndicatorRelease(g_ema_fast_sig);
-   IndicatorRelease(g_ema_slow_sig);
-   IndicatorRelease(g_rsi_handle);
-   IndicatorRelease(g_atr_handle);
-   IndicatorRelease(g_adx_handle);
+   for(int i = 0; i < g_sym_count; i++)
+     {
+      IndicatorRelease(g_ema_fast[i]);
+      IndicatorRelease(g_ema_slow[i]);
+      IndicatorRelease(g_atr[i]);
+     }
    Comment("");
-   Print("ProfitScalper v3 остановлен");
+   Print("ProfitScalper остановлен");
   }
 
 //+------------------------------------------------------------------+
@@ -207,147 +258,284 @@ void OnTick()
    if(DayRiskHit())
      {
       g_trading_paused = true;
-      PrintFormat("Дневной риск исчерпан: dayPnL=%.2f. Торговля стоп.", g_day_pnl);
+      PrintFormat("Дневной лимит: %.2f — стоп", g_day_pnl);
       return;
      }
 
-   MarketScore score;
-   if(!AnalyzeMarket(score))
-      return;
-
-   // Сначала фиксируем плюс по всем нашим позициям
-   ManageAllPositions(score);
-
-   const int open_now = CountOurPositions();
-   if(open_now >= InpMaxPositions)
-      return;
+   // Фиксация плюса по всем нашим позициям всех символов
+   ManageAllPositions();
 
    if(g_trades_today >= InpMaxTradesDay)
       return;
 
-   // Фарм-цикл: ждём пока все закроются, потом снова полный basket
-   if(InpFarmLoop)
-     {
-      if(open_now > 0)
-         return; // пока есть позиции — только управляем/фиксируем плюс
-
-      if(g_last_farm_ms > 0 &&
-         (GetTickCount64() - g_last_farm_ms) < (ulong)MathMax(InpFarmCooldownMs, 200))
-         return;
-
-      string filt_reason;
-      if(!FarmFiltersPass(score, filt_reason))
-        {
-         if(filt_reason != g_last_skip)
-           {
-            g_last_skip = filt_reason;
-            PrintFormat("Farm wait: %s", filt_reason);
-           }
-         return;
-        }
-
-      ENUM_ORDER_TYPE type;
-      string reason;
-      ResolveFarmDirection(score, type, reason);
-
-      int basket = MathMin(InpBasketOpen, InpMaxPositions);
-      if(basket < 1)
-         basket = 1;
-
-      int opened = OpenBasket(type, score, reason, basket);
-      if(opened > 0)
-        {
-         g_last_farm_ms = GetTickCount64();
-         g_last_farm_dir = type;
-         g_have_farm_dir = true;
-         PrintFormat("FARM cycle: открыто %d | %s", opened, reason);
-        }
-      return;
-     }
-
-   // Старый режим (по сигналу на новом баре)
-   datetime bar = iTime(_Symbol, InpSignalTF, 0);
-   if(bar == 0 || bar == g_last_bar_time)
+   if(!InpFarmLoop)
       return;
 
-   ENUM_ORDER_TYPE type;
-   string reason;
-   if(!PickEntry(score, type, reason))
-     {
-      if(reason != g_last_skip)
-        {
-         g_last_skip = reason;
-         PrintFormat("Ждём: %s | Buy=%d Sell=%d ADX=%.1f ATR=%.0f %s",
-                     reason, score.buy, score.sell, score.adx, score.atr_pts, score.session_name);
-        }
-      return;
-     }
-
-   g_last_bar_time = bar;
-   int can_open = InpMaxPositions - open_now;
-   int basket = MathMin(InpBasketOpen, can_open);
-   if(basket < 1) basket = 1;
-   OpenBasket(type, score, reason, basket);
+   for(int i = 0; i < g_sym_count; i++)
+      FarmSymbol(i);
   }
 
 //+------------------------------------------------------------------+
-bool FarmFiltersPass(const MarketScore &s, string &reason)
+void FarmSymbol(const int idx)
   {
-   // В фарм-режиме почти не стопаем — только совсем широкий спред
-   if(InpUseSpreadFilter && s.spread_pts > (double)MathMax(InpMaxSpreadPts * 3, 60))
+   const string sym = g_syms[idx];
+   int open_now = CountOurPositions(sym);
+   if(open_now > 0)
+      return; // ждём полного закрытия basket по символу
+
+   if(g_last_farm_ms[idx] > 0 &&
+      (GetTickCount64() - g_last_farm_ms[idx]) < (ulong)MathMax(InpFarmCooldownMs, 200))
+      return;
+
+   MarketScore score;
+   if(!AnalyzeSymbol(idx, score))
+      return;
+
+   if(InpUseSpreadFilter)
      {
-      reason = StringFormat("спред слишком широкий %.0f", s.spread_pts);
-      return false;
+      int max_spread = InpMaxSpreadPts;
+      if(IsGoldSymbol(sym))
+         max_spread = MathMax(max_spread, 300); // золото: шире
+      if(score.spread_pts > (double)max_spread)
+         return;
      }
+
+   ENUM_ORDER_TYPE type;
+   string reason;
+   ResolveDir(idx, score, type, reason);
+
+   int basket = MathMin(InpBasketOpen, InpMaxPositions);
+   int opened = OpenBasket(sym, type, score, reason, basket);
+   if(opened > 0)
+     {
+      g_last_farm_ms[idx] = GetTickCount64();
+      g_last_dir[idx] = type;
+      g_have_dir[idx] = true;
+      PrintFormat("FARM %s: +%d %s lot=%.2f", sym, opened,
+                  type == ORDER_TYPE_BUY ? "BUY" : "SELL", LotForSymbol(sym));
+     }
+  }
+
+//+------------------------------------------------------------------+
+bool AnalyzeSymbol(const int idx, MarketScore &s)
+  {
+   s.atr_pts = 0; s.spread_pts = 0; s.trend_up = false; s.trend_down = false;
+   string sym = g_syms[idx];
+
+   double fast[], slow[], atr[];
+   ArraySetAsSeries(fast, true);
+   ArraySetAsSeries(slow, true);
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(g_ema_fast[idx], 0, 0, 3, fast) < 3) return false;
+   if(CopyBuffer(g_ema_slow[idx], 0, 0, 3, slow) < 3) return false;
+   if(CopyBuffer(g_atr[idx], 0, 0, 3, atr) < 3) return false;
+
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(point <= 0.0) return false;
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   s.spread_pts = (ask - bid) / point;
+   s.atr_pts = atr[1] / point;
+   s.trend_up = (fast[1] > slow[1] && fast[1] >= fast[2]);
+   s.trend_down = (fast[1] < slow[1] && fast[1] <= fast[2]);
    return true;
   }
 
 //+------------------------------------------------------------------+
-void ResolveFarmDirection(const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
+void ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
   {
    if(InpDirection == DIR_BUY)
-     { type = ORDER_TYPE_BUY; reason = "FARM BUY fixed"; return; }
+     { type = ORDER_TYPE_BUY; reason = "fixed BUY"; return; }
    if(InpDirection == DIR_SELL)
-     { type = ORDER_TYPE_SELL; reason = "FARM SELL fixed"; return; }
+     { type = ORDER_TYPE_SELL; reason = "fixed SELL"; return; }
 
-   // Авто: по score/тренду; если равно — повтор последнего направления
-   if(s.buy > s.sell && s.trend_up)
-     { type = ORDER_TYPE_BUY; reason = "FARM AUTO buy"; return; }
-   if(s.sell > s.buy && s.trend_down)
-     { type = ORDER_TYPE_SELL; reason = "FARM AUTO sell"; return; }
    if(s.trend_up)
-     { type = ORDER_TYPE_BUY; reason = "FARM trend up"; return; }
+     { type = ORDER_TYPE_BUY; reason = "trend UP"; return; }
    if(s.trend_down)
-     { type = ORDER_TYPE_SELL; reason = "FARM trend down"; return; }
-   if(g_have_farm_dir)
+     { type = ORDER_TYPE_SELL; reason = "trend DN"; return; }
+   if(g_have_dir[idx])
      {
-      type = g_last_farm_dir;
-      reason = (type == ORDER_TYPE_BUY) ? "FARM last BUY" : "FARM last SELL";
+      type = g_last_dir[idx];
+      reason = "last dir";
       return;
      }
    type = ORDER_TYPE_SELL;
-   reason = "FARM default SELL";
+   reason = "default SELL";
   }
 
 //+------------------------------------------------------------------+
-int OpenBasket(const ENUM_ORDER_TYPE type, const MarketScore &s, const string reason, const int basket)
+int OpenBasket(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &s,
+               const string reason, const int basket)
   {
    int opened = 0;
    for(int i = 0; i < basket; i++)
      {
-      if(g_trades_today >= InpMaxTradesDay)
-         break;
-      if(CountOurPositions() >= InpMaxPositions)
-         break;
-      if(OpenTrade(type, s, reason + StringFormat(" #%d", i + 1)))
+      if(g_trades_today >= InpMaxTradesDay) break;
+      if(CountOurPositions(sym) >= InpMaxPositions) break;
+      if(OpenTrade(sym, type, s, reason + StringFormat(" #%d", i + 1)))
         {
          g_trades_today++;
          opened++;
         }
-      else
-         break;
+      else break;
      }
    return opened;
+  }
+
+//+------------------------------------------------------------------+
+bool OpenTrade(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &s, const string reason)
+  {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return false;
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) return false;
+
+   trade.SetTypeFillingBySymbol(sym);
+
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double sl_pts = MathMax(s.atr_pts * InpATR_SL_Mult, 30.0);
+   sl_pts = MathMax(sl_pts, s.spread_pts * 1.5 + 20.0);
+   double tp_pts = sl_pts * InpRewardRisk;
+
+   double sl = 0, tp = 0;
+   if(type == ORDER_TYPE_BUY)
+     {
+      double price = SymbolInfoDouble(sym, SYMBOL_ASK);
+      sl = NormalizeDouble(price - sl_pts * point, digits);
+      tp = NormalizeDouble(price + tp_pts * point, digits);
+     }
+   else
+     {
+      double price = SymbolInfoDouble(sym, SYMBOL_BID);
+      sl = NormalizeDouble(price + sl_pts * point, digits);
+      tp = NormalizeDouble(price - tp_pts * point, digits);
+     }
+
+   double lot = NormalizeLot(sym, LotForSymbol(sym));
+   string comment = IsGoldSymbol(sym) ? "PE Gold" : "PE Farm";
+
+   bool ok = (type == ORDER_TYPE_BUY)
+             ? trade.Buy(lot, sym, 0.0, sl, tp, comment)
+             : trade.Sell(lot, sym, 0.0, sl, tp, comment);
+
+   if(ok)
+      PrintFormat("OPEN %s %s lot=%.2f | %s", sym, type == ORDER_TYPE_BUY ? "BUY" : "SELL", lot, reason);
+   else
+      PrintFormat("OPEN fail %s: %d %s", sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   return ok;
+  }
+
+//+------------------------------------------------------------------+
+double NormalizeLot(const string sym, double lot)
+  {
+   double min_lot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double step_lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(step_lot <= 0.0) step_lot = 0.01;
+   int vol_digits = 2;
+   if(step_lot >= 1.0) vol_digits = 0;
+   else if(step_lot >= 0.1) vol_digits = 1;
+   lot = MathFloor(lot / step_lot + 1e-12) * step_lot;
+   if(lot < min_lot) lot = min_lot;
+   if(lot > max_lot) lot = max_lot;
+   return NormalizeDouble(lot, vol_digits);
+  }
+
+//+------------------------------------------------------------------+
+int CountOurPositions(const string sym = "")
+  {
+   int n = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(sym != "" && PositionGetString(POSITION_SYMBOL) != sym) continue;
+      n++;
+     }
+   return n;
+  }
+
+//+------------------------------------------------------------------+
+void ManageAllPositions()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      ManageOne(ticket);
+     }
+  }
+
+//+------------------------------------------------------------------+
+void ManageOne(const ulong ticket)
+  {
+   if(!PositionSelectByTicket(ticket)) return;
+   string sym = PositionGetString(POSITION_SYMBOL);
+   double money = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   double lock_at = MinProfitForSymbol(sym);
+
+   if(InpCloseOnProfit && money >= lock_at)
+     {
+      if(trade.PositionClose(ticket, InpDeviation))
+        {
+         // cooldown по символу
+         for(int i = 0; i < g_sym_count; i++)
+            if(g_syms[i] == sym)
+               g_last_farm_ms[i] = GetTickCount64();
+         PrintFormat("LOCK %s #%I64u +%.2f (need %.2f)", sym, ticket, money, lock_at);
+        }
+      return;
+     }
+
+   // BE / trailing
+   long type = PositionGetInteger(POSITION_TYPE);
+   double open = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP);
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   if(point <= 0) return;
+
+   double sl_dist = 0;
+   if(type == POSITION_TYPE_BUY && sl > 0) sl_dist = (open - sl) / point;
+   if(type == POSITION_TYPE_SELL && sl > 0) sl_dist = (sl - open) / point;
+   if(sl_dist <= 0) sl_dist = 100;
+   double profit_pts = (type == POSITION_TYPE_BUY) ? (bid - open) / point : (open - ask) / point;
+   double r_now = profit_pts / sl_dist;
+
+   if(InpUseBreakEven && r_now >= InpBE_R)
+     {
+      if(type == POSITION_TYPE_BUY)
+        {
+         double be = NormalizeDouble(open + InpBE_OffsetPts * point, digits);
+         if(sl < be) trade.PositionModify(ticket, be, tp);
+        }
+      else
+        {
+         double be = NormalizeDouble(open - InpBE_OffsetPts * point, digits);
+         if(sl == 0 || sl > be) trade.PositionModify(ticket, be, tp);
+        }
+     }
+
+   if(InpUseTrailing && r_now >= InpTrailStart_R)
+     {
+      // ATR-приближение: trail ~ 0.8 * текущий диапазон из sl_dist базового
+      double trail_pts = sl_dist * InpTrailATR_Mult * 0.5;
+      if(type == POSITION_TYPE_BUY)
+        {
+         double nsl = NormalizeDouble(bid - trail_pts * point, digits);
+         if(nsl > sl && nsl < bid) trade.PositionModify(ticket, nsl, tp);
+        }
+      else
+        {
+         double nsl = NormalizeDouble(ask + trail_pts * point, digits);
+         if((sl == 0 || nsl < sl) && nsl > ask) trade.PositionModify(ticket, nsl, tp);
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -355,19 +543,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
   {
-   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0)
-      return;
-   if(!HistoryDealSelect(trans.deal))
-      return;
-   if((long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic)
-      return;
-   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
-      return;
-
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0) return;
+   if(!HistoryDealSelect(trans.deal)) return;
+   if((long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic) return;
    long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
-   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT)
-      return;
-
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) return;
    g_day_pnl += HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
               + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
               + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
@@ -386,488 +566,41 @@ datetime DayStart()
 void ResetDayIfNeeded()
   {
    datetime start = DayStart();
-   if(start == g_day_start)
-      return;
+   if(start == g_day_start) return;
    g_day_start = start;
-   g_day_pnl = 0.0;
+   g_day_pnl = 0;
    g_day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_trading_paused = false;
    g_trades_today = 0;
-   g_last_skip = "";
-   Print("Новый день — лимиты обновлены");
+   Print("Новый день — лимиты сброшены");
   }
 
 //+------------------------------------------------------------------+
 bool DayRiskHit()
   {
-   if(InpMaxLossDay && g_day_pnl <= -MathAbs(InpMaxLossMoney))
-      return true;
-   if(InpMaxLossPct && g_day_start_balance > 0.0)
+   if(InpMaxLossDay && g_day_pnl <= -MathAbs(InpMaxLossMoney)) return true;
+   if(InpMaxLossPct && g_day_start_balance > 0)
      {
-      double limit = g_day_start_balance * InpMaxLossPercent / 100.0;
-      if(g_day_pnl <= -limit)
-         return true;
+      double lim = g_day_start_balance * InpMaxLossPercent / 100.0;
+      if(g_day_pnl <= -lim) return true;
      }
    return false;
-  }
-
-//+------------------------------------------------------------------+
-bool CopyBuf(const int handle, const int buffer, const int count, double &out[])
-  {
-   ArraySetAsSeries(out, true);
-   return CopyBuffer(handle, buffer, 0, count, out) == count;
-  }
-
-//+------------------------------------------------------------------+
-bool IsHourInRange(const int hour, const int start_h, const int end_h)
-  {
-   if(start_h == end_h) return true;
-   if(start_h < end_h)  return (hour >= start_h && hour < end_h);
-   return (hour >= start_h || hour < end_h);
-  }
-
-//+------------------------------------------------------------------+
-bool CheckSession(string &name)
-  {
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   const int h = dt.hour;
-   const bool london = IsHourInRange(h, InpLondonStart, InpLondonEnd);
-   const bool ny     = IsHourInRange(h, InpNYStart, InpNYEnd);
-   const bool asia   = IsHourInRange(h, InpAsiaStart, InpAsiaEnd);
-   const bool overlap = london && ny;
-
-   if(overlap) name = "Overlap LON+NY";
-   else if(london) name = "London";
-   else if(ny) name = "NewYork";
-   else if(asia) name = "Asian";
-   else name = "Off-hours";
-
-   switch(InpSessionMode)
-     {
-      case SESSION_ALL:     return true;
-      case SESSION_BEST:    return (overlap || london || ny);
-      case SESSION_LONDON:  return london;
-      case SESSION_NEWYORK: return ny;
-      case SESSION_ASIAN:   return asia;
-     }
-   return true;
-  }
-
-//+------------------------------------------------------------------+
-bool AnalyzeMarket(MarketScore &s)
-  {
-   s.buy = 0; s.sell = 0;
-   s.buy_reasons = ""; s.sell_reasons = "";
-   s.rsi = 0; s.atr_pts = 0; s.spread_pts = 0; s.adx = 0;
-   s.trend_up = false; s.trend_down = false;
-   s.session_ok = false; s.session_name = "";
-   s.pullback_buy = 0; s.pullback_sell = 0;
-
-   double fast_t[], slow_t[], fast_s[], slow_s[], rsi[], atr[], adx[];
-   if(!CopyBuf(g_ema_fast_trend, 0, 4, fast_t)) return false;
-   if(!CopyBuf(g_ema_slow_trend, 0, 4, slow_t)) return false;
-   if(!CopyBuf(g_ema_fast_sig,   0, 4, fast_s)) return false;
-   if(!CopyBuf(g_ema_slow_sig,   0, 4, slow_s)) return false;
-   if(!CopyBuf(g_rsi_handle,     0, 4, rsi))    return false;
-   if(!CopyBuf(g_atr_handle,     0, 4, atr))    return false;
-   if(!CopyBuf(g_adx_handle,     0, 4, adx))    return false; // buffer 0 = ADX
-
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   if(point <= 0.0) return false;
-
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   s.rsi = rsi[1]; // закрытый бар — меньше шума
-   s.atr_pts = atr[1] / point;
-   s.spread_pts = (ask - bid) / point;
-   s.adx = adx[1];
-   s.trend_up = (fast_t[1] > slow_t[1] && fast_t[1] > fast_t[2]);
-   s.trend_down = (fast_t[1] < slow_t[1] && fast_t[1] < fast_t[2]);
-   s.session_ok = CheckSession(s.session_name);
-
-   // 1) Старший тренд
-   if(fast_t[1] > slow_t[1]) { s.buy++;  s.buy_reasons  += "H1up "; }
-   if(fast_t[1] < slow_t[1]) { s.sell++; s.sell_reasons += "H1dn "; }
-
-   // 2) Импульс EMA
-   if(s.trend_up)   { s.buy++;  s.buy_reasons  += "impulseUp "; }
-   if(s.trend_down) { s.sell++; s.sell_reasons += "impulseDn "; }
-
-   // 3) Согласование сигнального ТФ
-   if(fast_s[1] > slow_s[1]) { s.buy++;  s.buy_reasons  += "M15bull "; }
-   if(fast_s[1] < slow_s[1]) { s.sell++; s.sell_reasons += "M15bear "; }
-
-   // 4) ADX сила тренда
-   if(s.adx >= InpMinADX)
-     {
-      if(fast_t[1] > slow_t[1]) { s.buy++;  s.buy_reasons  += "ADXok "; }
-      if(fast_t[1] < slow_t[1]) { s.sell++; s.sell_reasons += "ADXok "; }
-     }
-
-   // 5) RSI в зоне продолжения тренда (не край)
-   if(s.rsi > 45.0 && s.rsi < 68.0) { s.buy++;  s.buy_reasons  += "RSIbuy "; }
-   if(s.rsi < 55.0 && s.rsi > 32.0) { s.sell++; s.sell_reasons += "RSIsell "; }
-
-   // 6) Бычья/медвежья свеча сигнала
-   double o = iOpen(_Symbol, InpSignalTF, 1);
-   double c = iClose(_Symbol, InpSignalTF, 1);
-   double h = iHigh(_Symbol, InpSignalTF, 1);
-   double l = iLow(_Symbol, InpSignalTF, 1);
-   double range = h - l;
-   if(range > 0.0)
-     {
-      double body = MathAbs(c - o) / range;
-      if(c > o && body >= 0.5) { s.buy++;  s.buy_reasons  += "bullBar "; }
-      if(c < o && body >= 0.5) { s.sell++; s.sell_reasons += "bearBar "; }
-     }
-
-   // 7) Цена по сторону EMA + качество отката
-   if(bid > fast_s[1] && bid > slow_s[1])
-     {
-      s.buy++;
-      s.buy_reasons += "aboveEMA ";
-     }
-   if(bid < fast_s[1] && bid < slow_s[1])
-     {
-      s.sell++;
-      s.sell_reasons += "belowEMA ";
-     }
-
-   // Откат: расстояние до быстрой EMA в долях ATR (ближе = лучше для входа)
-   if(atr[1] > 0.0)
-     {
-      s.pullback_buy  = 1.0 - MathMin(1.0, MathAbs(bid - fast_s[1]) / atr[1]);
-      s.pullback_sell = s.pullback_buy;
-      if(InpPullbackEntry)
-        {
-         // Buy: цена около/чуть выше EMA после отката, не далеко в отрыве
-         if(bid >= fast_s[1] && (bid - fast_s[1]) <= atr[1] * 0.6)
-           { s.buy++; s.buy_reasons += "pullback "; }
-         if(bid <= fast_s[1] && (fast_s[1] - bid) <= atr[1] * 0.6)
-           { s.sell++; s.sell_reasons += "pullback "; }
-        }
-     }
-
-   // Бонус лучшей сессии
-   if(StringFind(s.session_name, "Overlap") >= 0 || s.session_name == "London" || s.session_name == "NewYork")
-     {
-      s.buy++;  s.buy_reasons  += "session ";
-      s.sell++; s.sell_reasons += "session ";
-     }
-
-   return true;
-  }
-
-//+------------------------------------------------------------------+
-bool FiltersPass(const MarketScore &s, string &reason)
-  {
-   if(!s.session_ok)
-     {
-      reason = "вне сессии (" + s.session_name + ")";
-      return false;
-     }
-   if(s.adx < InpMinADX)
-     {
-      reason = StringFormat("слабый тренд ADX %.1f < %.1f", s.adx, InpMinADX);
-      return false;
-     }
-   if(InpUseSpreadFilter && s.spread_pts > (double)InpMaxSpreadPts)
-     {
-      reason = StringFormat("спред %.0f", s.spread_pts);
-      return false;
-     }
-   if(s.atr_pts < InpMinATRPoints)
-     {
-      reason = StringFormat("низкий ATR %.0f", s.atr_pts);
-      return false;
-     }
-   if(InpMaxATRPoints > 0.0 && s.atr_pts > InpMaxATRPoints)
-     {
-      reason = StringFormat("слишком высокий ATR %.0f", s.atr_pts);
-      return false;
-     }
-   return true;
-  }
-
-//+------------------------------------------------------------------+
-bool PickEntry(const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
-  {
-   if(!FiltersPass(s, reason))
-      return false;
-
-   bool buy_ok  = (s.buy  >= InpMinScore && s.buy  >= s.sell + InpScoreGap && s.trend_up);
-   bool sell_ok = (s.sell >= InpMinScore && s.sell >= s.buy  + InpScoreGap && s.trend_down);
-
-   if(InpDirection == DIR_BUY)
-     {
-      if(!buy_ok) { reason = StringFormat("Buy слаб %d", s.buy); return false; }
-      type = ORDER_TYPE_BUY; reason = "BUY " + s.buy_reasons; return true;
-     }
-   if(InpDirection == DIR_SELL)
-     {
-      if(!sell_ok) { reason = StringFormat("Sell слаб %d", s.sell); return false; }
-      type = ORDER_TYPE_SELL; reason = "SELL " + s.sell_reasons; return true;
-     }
-
-   if(buy_ok && (!sell_ok || s.buy > s.sell))
-     { type = ORDER_TYPE_BUY; reason = "AUTO BUY " + s.buy_reasons; return true; }
-   if(sell_ok && (!buy_ok || s.sell > s.buy))
-     { type = ORDER_TYPE_SELL; reason = "AUTO SELL " + s.sell_reasons; return true; }
-
-   reason = StringFormat("нет края Buy=%d Sell=%d ADX=%.1f", s.buy, s.sell, s.adx);
-   return false;
-  }
-
-//+------------------------------------------------------------------+
-int CountOurPositions()
-  {
-   int n = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
-      n++;
-     }
-   return n;
-  }
-
-//+------------------------------------------------------------------+
-bool HasOurPosition()
-  {
-   return CountOurPositions() > 0;
-  }
-
-//+------------------------------------------------------------------+
-bool SelectOurPosition(ulong &ticket)
-  {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
-      return true;
-     }
-   ticket = 0;
-   return false;
-  }
-
-//+------------------------------------------------------------------+
-double PositionProfitMoney()
-  {
-   return PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-  }
-
-//+------------------------------------------------------------------+
-double NormalizeLot(double lot)
-  {
-   double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double step_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   if(step_lot <= 0.0) step_lot = 0.01;
-   int vol_digits = 2;
-   if(step_lot >= 1.0) vol_digits = 0;
-   else if(step_lot >= 0.1) vol_digits = 1;
-
-   lot = MathFloor(lot / step_lot + 1e-12) * step_lot;
-   if(lot < min_lot) lot = min_lot;
-   if(lot > max_lot) lot = max_lot;
-   return NormalizeDouble(lot, vol_digits);
-  }
-
-//+------------------------------------------------------------------+
-double CalcLotByRisk(const double sl_points)
-  {
-   if(sl_points <= 0.0)
-      return NormalizeLot(InpLot);
-
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double risk_money = balance * InpRiskPercent / 100.0;
-
-   double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double point      = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   if(tick_size <= 0.0 || tick_value <= 0.0 || point <= 0.0)
-      return NormalizeLot(InpLot);
-
-   double money_per_point = tick_value * (point / tick_size);
-   if(money_per_point <= 0.0)
-      return NormalizeLot(InpLot);
-
-   double lot = risk_money / (sl_points * money_per_point);
-   return NormalizeLot(lot);
-  }
-
-//+------------------------------------------------------------------+
-void CalcSLTP(const ENUM_ORDER_TYPE type, const MarketScore &s,
-              double &sl, double &tp, double &sl_pts)
-  {
-   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   sl_pts = MathMax(s.atr_pts * InpATR_SL_Mult, InpMinATRPoints);
-
-   // SL не ближе 1.2 спреда
-   sl_pts = MathMax(sl_pts, s.spread_pts * 1.2 + 10.0);
-   double tp_pts = sl_pts * InpRewardRisk;
-
-   if(type == ORDER_TYPE_BUY)
-     {
-      double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      sl = NormalizeDouble(price - sl_pts * point, digits);
-      tp = NormalizeDouble(price + tp_pts * point, digits);
-     }
-   else
-     {
-      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      sl = NormalizeDouble(price + sl_pts * point, digits);
-      tp = NormalizeDouble(price - tp_pts * point, digits);
-     }
-  }
-
-//+------------------------------------------------------------------+
-bool OpenTrade(const ENUM_ORDER_TYPE type, const MarketScore &s, const string reason)
-  {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return false;
-   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) return false;
-
-   double sl = 0, tp = 0, sl_pts = 0;
-   CalcSLTP(type, s, sl, tp, sl_pts);
-
-   double lot = (InpLotMode == LOT_RISK) ? CalcLotByRisk(sl_pts) : NormalizeLot(InpLot);
-   string comment = (type == ORDER_TYPE_BUY) ? "PE Buy" : "PE Sell";
-
-   bool ok = (type == ORDER_TYPE_BUY)
-             ? trade.Buy(lot, _Symbol, 0.0, sl, tp, comment)
-             : trade.Sell(lot, _Symbol, 0.0, sl, tp, comment);
-
-   if(ok)
-     {
-      PrintFormat("OPEN %s lot=%.2f SL=%.0fpts | Buy=%d Sell=%d ADX=%.1f | %s",
-                  type == ORDER_TYPE_BUY ? "BUY" : "SELL",
-                  lot, sl_pts, s.buy, s.sell, s.adx, reason);
-      return true;
-     }
-
-   PrintFormat("Ошибка OPEN: %d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
-   return false;
-  }
-
-//+------------------------------------------------------------------+
-void ManageOnePosition(const ulong ticket, const MarketScore &s)
-  {
-   if(!PositionSelectByTicket(ticket))
-      return;
-   if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-      return;
-   if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic)
-      return;
-
-   long   type = PositionGetInteger(POSITION_TYPE);
-   double open = PositionGetDouble(POSITION_PRICE_OPEN);
-   double sl   = PositionGetDouble(POSITION_SL);
-   double tp   = PositionGetDouble(POSITION_TP);
-   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   if(point <= 0.0) return;
-
-   double money = PositionProfitMoney();
-
-   // Главное: сразу закрываем, как только плюс достиг порога
-   if(InpCloseOnProfit && money >= InpMinProfitMoney)
-     {
-      if(trade.PositionClose(ticket, InpDeviation))
-        {
-         g_last_farm_ms = GetTickCount64(); // небольшая пауза перед следующим циклом
-         PrintFormat("LOCK PROFIT #%I64u money=%.2f (>= %.2f)", ticket, money, InpMinProfitMoney);
-        }
-      return;
-     }
-
-   double sl_dist = 0.0;
-   if(type == POSITION_TYPE_BUY && sl > 0.0)
-      sl_dist = (open - sl) / point;
-   else if(type == POSITION_TYPE_SELL && sl > 0.0)
-      sl_dist = (sl - open) / point;
-   if(sl_dist <= 0.0)
-      sl_dist = MathMax(s.atr_pts * InpATR_SL_Mult, InpMinATRPoints);
-
-   double profit_pts = (type == POSITION_TYPE_BUY) ? (bid - open) / point : (open - ask) / point;
-   double r_now = profit_pts / sl_dist;
-
-   if(InpUseBreakEven && r_now >= InpBE_R)
-     {
-      double be = 0.0;
-      if(type == POSITION_TYPE_BUY)
-        {
-         be = NormalizeDouble(open + InpBE_OffsetPts * point, digits);
-         if(sl < be)
-            trade.PositionModify(ticket, be, tp);
-        }
-      else
-        {
-         be = NormalizeDouble(open - InpBE_OffsetPts * point, digits);
-         if(sl == 0.0 || sl > be)
-            trade.PositionModify(ticket, be, tp);
-        }
-     }
-
-   if(InpUseTrailing && r_now >= InpTrailStart_R && s.atr_pts > 0.0)
-     {
-      double trail_pts = s.atr_pts * InpTrailATR_Mult;
-      if(type == POSITION_TYPE_BUY)
-        {
-         double new_sl = NormalizeDouble(bid - trail_pts * point, digits);
-         if(new_sl > sl && new_sl < bid)
-            trade.PositionModify(ticket, new_sl, tp);
-        }
-      else
-        {
-         double new_sl = NormalizeDouble(ask + trail_pts * point, digits);
-         if((sl == 0.0 || new_sl < sl) && new_sl > ask)
-            trade.PositionModify(ticket, new_sl, tp);
-        }
-     }
-
-   if(InpCloseOnWeakTrend)
-     {
-      bool weak = (s.adx < InpMinADX * 0.85);
-      bool against = (type == POSITION_TYPE_BUY && s.trend_down) ||
-                     (type == POSITION_TYPE_SELL && s.trend_up);
-      if(weak && against && money < 0.0)
-        {
-         if(trade.PositionClose(ticket, InpDeviation))
-            PrintFormat("EXIT weak-trend #%I64u money=%.2f", ticket, money);
-        }
-     }
-  }
-
-//+------------------------------------------------------------------+
-void ManageAllPositions(const MarketScore &s)
-  {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0)
-         continue;
-      ManageOnePosition(ticket, s);
-     }
   }
 
 //+------------------------------------------------------------------+
 void UpdatePanel()
   {
-   string text = StringFormat(
-                    "ProfitScalper v3.20 FARM\n%s | dayPnL: %.2f | open: %d/%d | dayTrades: %d\nlot=%.2f | lock>=$%.2f | loop=%s | paused: %s",
-                    _Symbol, g_day_pnl, CountOurPositions(), InpMaxPositions, g_trades_today,
-                    InpLot, InpMinProfitMoney, InpFarmLoop ? "ON" : "off",
-                    g_trading_paused ? "YES" : "no");
-   Comment(text);
+   string list = "";
+   for(int i = 0; i < g_sym_count; i++)
+     {
+      if(i > 0) list += ",";
+      list += g_syms[i] + "(" + IntegerToString(CountOurPositions(g_syms[i])) + ")";
+     }
+   Comment(StringFormat(
+              "ProfitScalper v3.30 MULTI+GOLD\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | farm=%s | pause=%s",
+              list, g_day_pnl, g_trades_today, InpLot, InpGoldLot,
+              InpMinProfitMoney, InpGoldMinProfit,
+              InpFarmLoop ? "ON" : "off",
+              g_trading_paused ? "YES" : "no"));
   }
 //+------------------------------------------------------------------+
