@@ -4,8 +4,8 @@
 //|  break-even и trailing. Без гарантий прибыли.                    |
 //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.10"
-#property description "Робот: до 5 позиций, лот 0.1, фиксация плюса сразу"
+#property version   "3.20"
+#property description "Постоянный фарм: 5x0.1, закрыл плюс → снова открыл"
 
 #include <Trade/Trade.mqh>
 
@@ -39,19 +39,21 @@ input double               InpRiskPercent = 1.0;     // Риск на сделк
 input int                  InpMagic     = 26071403;
 input int                  InpDeviation = 30;
 input int                  InpMaxPositions = 5;      // Сколько позиций держать одновременно
-input int                  InpBasketOpen = 5;        // Сколько открывать за один сигнал
-input int                  InpMaxTradesDay = 40;      // Макс. сделок за день
+input int                  InpBasketOpen = 5;        // Сколько открывать за один заход
+input int                  InpMaxTradesDay = 200;    // Макс. сделок за день
+input bool                 InpFarmLoop = true;       // Постоянный цикл: закрыл → снова открыл
+input int                  InpFarmCooldownMs = 800;  // Пауза перед новым заходом (мс)
 
 input group "=== Фиксация прибыли ==="
 input double               InpMinProfitMoney = 0.30; // Закрыть сделку при плюсе >= $
 input bool                 InpCloseOnProfit  = true; // Закрывать сразу при плюсе
-input double               InpRewardRisk = 1.5;      // TP = SL * R (страховка, если не закрыли по $)
-input bool                 InpUseBreakEven = true;   // Перенос SL в безубыток
-input double               InpBE_R       = 0.6;      // Безубыток после X*R прибыли
-input double               InpBE_OffsetPts = 3.0;    // Запас BE в пунктах
-input bool                 InpUseTrailing = true;    // Трейлинг прибыли
-input double               InpTrailStart_R = 0.8;    // Старт трейла после X*R
-input double               InpTrailATR_Mult = 0.8;   // Дистанция трейла = ATR * k
+input double               InpRewardRisk = 1.5;      // TP = SL * R (страховка)
+input bool                 InpUseBreakEven = true;
+input double               InpBE_R       = 0.6;
+input double               InpBE_OffsetPts = 3.0;
+input bool                 InpUseTrailing = true;
+input double               InpTrailStart_R = 0.8;
+input double               InpTrailATR_Mult = 0.8;
 
 input group "=== Анализ ==="
 input ENUM_TIMEFRAMES      InpTrendTF   = PERIOD_H1;
@@ -106,6 +108,9 @@ bool     g_trading_paused = false;
 datetime g_last_bar_time = 0;
 int      g_trades_today = 0;
 string   g_last_skip = "";
+ulong    g_last_farm_ms = 0;
+ENUM_ORDER_TYPE g_last_farm_dir = ORDER_TYPE_SELL;
+bool     g_have_farm_dir = false;
 
 struct MarketScore
   {
@@ -171,8 +176,8 @@ int OnInit()
    g_day_pnl = 0.0;
    g_trades_today = 0;
 
-   PrintFormat("ProfitScalper v3.10 | %s | lot=%.2f | maxPos=%d | lock>=$%.2f",
-               _Symbol, InpLot, InpMaxPositions, InpMinProfitMoney);
+   PrintFormat("ProfitScalper v3.20 FARM | %s | lot=%.2f | basket=%d | lock>=$%.2f | loop=%s",
+               _Symbol, InpLot, InpBasketOpen, InpMinProfitMoney, InpFarmLoop ? "ON" : "off");
    return INIT_SUCCEEDED;
   }
 
@@ -220,6 +225,47 @@ void OnTick()
    if(g_trades_today >= InpMaxTradesDay)
       return;
 
+   // Фарм-цикл: ждём пока все закроются, потом снова полный basket
+   if(InpFarmLoop)
+     {
+      if(open_now > 0)
+         return; // пока есть позиции — только управляем/фиксируем плюс
+
+      if(g_last_farm_ms > 0 &&
+         (GetTickCount64() - g_last_farm_ms) < (ulong)MathMax(InpFarmCooldownMs, 200))
+         return;
+
+      string filt_reason;
+      if(!FarmFiltersPass(score, filt_reason))
+        {
+         if(filt_reason != g_last_skip)
+           {
+            g_last_skip = filt_reason;
+            PrintFormat("Farm wait: %s", filt_reason);
+           }
+         return;
+        }
+
+      ENUM_ORDER_TYPE type;
+      string reason;
+      ResolveFarmDirection(score, type, reason);
+
+      int basket = MathMin(InpBasketOpen, InpMaxPositions);
+      if(basket < 1)
+         basket = 1;
+
+      int opened = OpenBasket(type, score, reason, basket);
+      if(opened > 0)
+        {
+         g_last_farm_ms = GetTickCount64();
+         g_last_farm_dir = type;
+         g_have_farm_dir = true;
+         PrintFormat("FARM cycle: открыто %d | %s", opened, reason);
+        }
+      return;
+     }
+
+   // Старый режим (по сигналу на новом баре)
    datetime bar = iTime(_Symbol, InpSignalTF, 0);
    if(bar == 0 || bar == g_last_bar_time)
       return;
@@ -238,17 +284,66 @@ void OnTick()
      }
 
    g_last_bar_time = bar;
-
    int can_open = InpMaxPositions - open_now;
    int basket = MathMin(InpBasketOpen, can_open);
    if(basket < 1) basket = 1;
+   OpenBasket(type, score, reason, basket);
+  }
 
+//+------------------------------------------------------------------+
+bool FarmFiltersPass(const MarketScore &s, string &reason)
+  {
+   if(InpUseSpreadFilter && s.spread_pts > (double)InpMaxSpreadPts)
+     {
+      reason = StringFormat("спред %.0f", s.spread_pts);
+      return false;
+     }
+   if(s.atr_pts < InpMinATRPoints * 0.5)
+     {
+      reason = StringFormat("мертвый рынок ATR %.0f", s.atr_pts);
+      return false;
+     }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+void ResolveFarmDirection(const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
+  {
+   if(InpDirection == DIR_BUY)
+     { type = ORDER_TYPE_BUY; reason = "FARM BUY fixed"; return; }
+   if(InpDirection == DIR_SELL)
+     { type = ORDER_TYPE_SELL; reason = "FARM SELL fixed"; return; }
+
+   // Авто: по score/тренду; если равно — повтор последнего направления
+   if(s.buy > s.sell && s.trend_up)
+     { type = ORDER_TYPE_BUY; reason = "FARM AUTO buy"; return; }
+   if(s.sell > s.buy && s.trend_down)
+     { type = ORDER_TYPE_SELL; reason = "FARM AUTO sell"; return; }
+   if(s.trend_up)
+     { type = ORDER_TYPE_BUY; reason = "FARM trend up"; return; }
+   if(s.trend_down)
+     { type = ORDER_TYPE_SELL; reason = "FARM trend down"; return; }
+   if(g_have_farm_dir)
+     {
+      type = g_last_farm_dir;
+      reason = (type == ORDER_TYPE_BUY) ? "FARM last BUY" : "FARM last SELL";
+      return;
+     }
+   type = ORDER_TYPE_SELL;
+   reason = "FARM default SELL";
+  }
+
+//+------------------------------------------------------------------+
+int OpenBasket(const ENUM_ORDER_TYPE type, const MarketScore &s, const string reason, const int basket)
+  {
    int opened = 0;
    for(int i = 0; i < basket; i++)
      {
       if(g_trades_today >= InpMaxTradesDay)
          break;
-      if(OpenTrade(type, score, reason + StringFormat(" #%d", i + 1)))
+      if(CountOurPositions() >= InpMaxPositions)
+         break;
+      if(OpenTrade(type, s, reason + StringFormat(" #%d", i + 1)))
         {
          g_trades_today++;
          opened++;
@@ -256,9 +351,7 @@ void OnTick()
       else
          break;
      }
-   if(opened > 0)
-      PrintFormat("Basket: открыто %d из %d | позиций всего ~%d",
-                  opened, basket, CountOurPositions());
+   return opened;
   }
 
 //+------------------------------------------------------------------+
@@ -694,7 +787,10 @@ void ManageOnePosition(const ulong ticket, const MarketScore &s)
    if(InpCloseOnProfit && money >= InpMinProfitMoney)
      {
       if(trade.PositionClose(ticket, InpDeviation))
+        {
+         g_last_farm_ms = GetTickCount64(); // небольшая пауза перед следующим циклом
          PrintFormat("LOCK PROFIT #%I64u money=%.2f (>= %.2f)", ticket, money, InpMinProfitMoney);
+        }
       return;
      }
 
@@ -772,9 +868,9 @@ void ManageAllPositions(const MarketScore &s)
 void UpdatePanel()
   {
    string text = StringFormat(
-                    "ProfitScalper v3.10\n%s | dayPnL: %.2f | open: %d/%d | dayTrades: %d\nlot=%.2f | lock>=$%.2f | basket=%d | paused: %s",
+                    "ProfitScalper v3.20 FARM\n%s | dayPnL: %.2f | open: %d/%d | dayTrades: %d\nlot=%.2f | lock>=$%.2f | loop=%s | paused: %s",
                     _Symbol, g_day_pnl, CountOurPositions(), InpMaxPositions, g_trades_today,
-                    InpLot, InpMinProfitMoney, InpBasketOpen,
+                    InpLot, InpMinProfitMoney, InpFarmLoop ? "ON" : "off",
                     g_trading_paused ? "YES" : "no");
    Comment(text);
   }
