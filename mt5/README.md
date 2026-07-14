@@ -1,36 +1,36 @@
-# ProfitScalper v3.30 — Forex + золото
+# ProfitScalper v3.40 — Forex + золото + база знаний
 
-Фарм-цикл: открывает корзину позиций → закрывает при фиксации плюса → снова открывает. Работает на **символе графика** и дополнительно на **золоте** (`XAUUSD` / `GOLD`).
+Фарм-цикл с выбором стороны по **свечам и структуре графика** (поглощение, пин/молот, HH/HL, импульс) + EMA.
+
+Полный текст базы знаний: [`docs/BAZA_ZNANIY.md`](docs/BAZA_ZNANIY.md)  
+Код оценки: [`Include/ChartKnowledge.mqh`](Include/ChartKnowledge.mqh)
 
 ## Что умеет
 
-1. До **5 позиций × 0.10** лота на каждый символ
-2. Закрытие, как только floating profit ≥ порога ($0.30 forex / $0.80 золото)
-3. Непрерывный `FarmLoop` с cooldown ~800 мс
-4. Авто-поиск имени золота у брокера (`XAUUSD`, `GOLD`, `XAUUSDm` …)
+1. До **5 позиций × 0.10** на каждый символ (forex и золото отдельно)
+2. Закрытие при плюсе: FX ≥ $0.30, золото ≥ $0.80
+3. `FarmLoop` — открыл → закрыл плюс → снова
+4. Авто-поиск золота (`XAUUSD` / `GOLD` / …)
+5. **База знаний** в `DIR_AUTO`: score BUY/SELL по паттернам
 
 ## Установка
 
-Готовый бинарник: `mt5/Experts/ProfitScalper.ex5`
-
-1. Скопировать `ProfitScalper.ex5` (или `.mq5`) → `MQL5/Experts/`
-2. При `.mq5` — Compile (F7) в MetaEditor
-3. Навесить на график (например USDCHF) + **Algo Trading ON**
-4. В inputs: `AlsoSymbols = XAUUSD` (по умолчанию уже так)
+1. Скопировать в терминал:
+   - `Experts/ProfitScalper.mq5` (+ `.ex5` если есть)
+   - `Include/ChartKnowledge.mqh` → `MQL5/Include/` **или** держать относительный путь `../Include/`
+2. Compile (F7) → на график → **Algo Trading ON**
+3. `AlsoSymbols = XAUUSD`
 
 ## Ключевые настройки
 
 | Параметр | По умолчанию | Смысл |
 |---|---|---|
-| `Lot` | 0.10 | Лот валютных пар |
-| `GoldLot` | 0.10 | Лот золота |
-| `MaxPositions` / `BasketOpen` | 5 | Корзина на символ |
-| `AlsoSymbols` | XAUUSD | Доп. символы через запятую |
-| `MinProfitMoney` | 0.30 | Фикс. плюс ($) forex |
-| `GoldMinProfit` | 0.80 | Фикс. плюс ($) золото |
-| `FarmLoop` | true | Открыл → закрыл → снова |
-| `MaxSpreadPts` | 80 | Для золота внутри кода ≥300 |
+| `UseKnowledge` | true | Свечи/структура для стороны |
+| `KnowledgeGap` | 2 | Мин. отрыв баллов BUY vs SELL |
+| `Lot` / `GoldLot` | 0.10 | Лоты |
+| `FarmLoop` | true | Непрерывный фарм |
+| `AlsoSymbols` | XAUUSD | Доп. символы |
 
 ## Честно
 
-Демо сначала. Гарантии прибыли нет. Для 24/7 нужен Windows VPS — облачный агент не держит терминал постоянно.
+Паттерны повышают вероятность стороны, **не гарантируют** прибыль. Сначала демо. Для 24/7 — Windows VPS.

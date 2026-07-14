@@ -1,12 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.30 — фарм-цикл на нескольких символах (Forex + золото)       |
+//|  v3.40 — фарм + база знаний свечей/структуры графика             |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.30"
-#property description "Фарм 5x0.1: forex + золото XAUUSD, закрыл плюс → снова"
+#property version   "3.40"
+#property description "Фарм forex+золото + база знаний свечей (поглощение, пин, HH/HL)"
 
 #include <Trade/Trade.mqh>
+#include "../Include/ChartKnowledge.mqh"
 
 enum ENUM_TRADE_DIRECTION
   {
@@ -53,6 +54,10 @@ input int                  InpATRPeriod = 14;
 input double               InpATR_SL_Mult = 1.8;
 input bool                 InpUseSpreadFilter = true; // Фильтр спреда
 input int                  InpMaxSpreadPts = 80;     // шире — золото обычно больше
+
+input group "=== База знаний (свечи) ==="
+input bool                 InpUseKnowledge = true;   // Свечи/структура для направления
+input int                  InpKnowledgeGap = 2;      // Мин. отрыв BUY vs SELL баллов
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
@@ -228,8 +233,10 @@ int OnInit()
    g_day_pnl = 0.0;
    g_trades_today = 0;
 
-   PrintFormat("ProfitScalper v3.30 MULTI | symbols=%d | lot=%.2f goldLot=%.2f | farm=%s",
-               g_sym_count, InpLot, InpGoldLot, InpFarmLoop ? "ON" : "off");
+   PrintFormat("ProfitScalper v3.40 KB | symbols=%d | lot=%.2f goldLot=%.2f | farm=%s | knowledge=%s",
+               g_sym_count, InpLot, InpGoldLot,
+               InpFarmLoop ? "ON" : "off",
+               InpUseKnowledge ? "ON" : "off");
    return INIT_SUCCEEDED;
   }
 
@@ -348,6 +355,28 @@ void ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
      { type = ORDER_TYPE_BUY; reason = "fixed BUY"; return; }
    if(InpDirection == DIR_SELL)
      { type = ORDER_TYPE_SELL; reason = "fixed SELL"; return; }
+
+   // База знаний: свечи + структура + EMA → сторона входа
+   if(InpUseKnowledge)
+     {
+      KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
+      if(KnowledgePickDir(ks, MathMax(InpKnowledgeGap, 1), type, reason))
+         return;
+      // нет явного края — если есть тренд EMA, берём его
+      if(s.trend_up)
+        { type = ORDER_TYPE_BUY; reason = "KB flat→EMA↑ " + ks.reason; return; }
+      if(s.trend_down)
+        { type = ORDER_TYPE_SELL; reason = "KB flat→EMA↓ " + ks.reason; return; }
+      if(g_have_dir[idx])
+        {
+         type = g_last_dir[idx];
+         reason = "KB flat→last " + ks.reason;
+         return;
+        }
+      type = ORDER_TYPE_SELL;
+      reason = "KB flat→default SELL " + ks.reason;
+      return;
+     }
 
    if(s.trend_up)
      { type = ORDER_TYPE_BUY; reason = "trend UP"; return; }
@@ -597,10 +626,11 @@ void UpdatePanel()
       list += g_syms[i] + "(" + IntegerToString(CountOurPositions(g_syms[i])) + ")";
      }
    Comment(StringFormat(
-              "ProfitScalper v3.30 MULTI+GOLD\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | farm=%s | pause=%s",
+              "ProfitScalper v3.40 KB+GOLD\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | farm=%s | KB=%s | pause=%s",
               list, g_day_pnl, g_trades_today, InpLot, InpGoldLot,
               InpMinProfitMoney, InpGoldMinProfit,
               InpFarmLoop ? "ON" : "off",
+              InpUseKnowledge ? "ON" : "off",
               g_trading_paused ? "YES" : "no"));
   }
 //+------------------------------------------------------------------+
