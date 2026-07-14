@@ -4,8 +4,8 @@
 //|  break-even и trailing. Без гарантий прибыли.                    |
 //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.00"
-#property description "Торговый робот: тренд + риск-менеджмент + TP/trailing"
+#property version   "3.10"
+#property description "Робот: до 5 позиций, лот 0.1, фиксация плюса сразу"
 
 #include <Trade/Trade.mqh>
 
@@ -34,20 +34,24 @@ enum ENUM_LOT_MODE
 input group "=== Торговля ==="
 input ENUM_TRADE_DIRECTION InpDirection = DIR_AUTO;
 input ENUM_LOT_MODE        InpLotMode   = LOT_FIXED;
-input double               InpLot       = 0.01;      // Лот (если Fixed)
+input double               InpLot       = 0.10;      // Лот (минимум 0.1)
 input double               InpRiskPercent = 1.0;     // Риск на сделку, % депозита
 input int                  InpMagic     = 26071403;
 input int                  InpDeviation = 30;
-input int                  InpMaxTradesDay = 20;      // Макс. сделок за день
+input int                  InpMaxPositions = 5;      // Сколько позиций держать одновременно
+input int                  InpBasketOpen = 5;        // Сколько открывать за один сигнал
+input int                  InpMaxTradesDay = 40;      // Макс. сделок за день
 
-input group "=== Цель прибыли (R-модуль) ==="
-input double               InpRewardRisk = 2.0;      // TP = SL * R (цель > риска)
+input group "=== Фиксация прибыли ==="
+input double               InpMinProfitMoney = 0.30; // Закрыть сделку при плюсе >= $
+input bool                 InpCloseOnProfit  = true; // Закрывать сразу при плюсе
+input double               InpRewardRisk = 1.5;      // TP = SL * R (страховка, если не закрыли по $)
 input bool                 InpUseBreakEven = true;   // Перенос SL в безубыток
-input double               InpBE_R       = 1.0;      // Безубыток после X*R прибыли
-input double               InpBE_OffsetPts = 5.0;    // Запас BE в пунктах
+input double               InpBE_R       = 0.6;      // Безубыток после X*R прибыли
+input double               InpBE_OffsetPts = 3.0;    // Запас BE в пунктах
 input bool                 InpUseTrailing = true;    // Трейлинг прибыли
-input double               InpTrailStart_R = 1.2;    // Старт трейла после X*R
-input double               InpTrailATR_Mult = 1.0;   // Дистанция трейла = ATR * k
+input double               InpTrailStart_R = 0.8;    // Старт трейла после X*R
+input double               InpTrailATR_Mult = 0.8;   // Дистанция трейла = ATR * k
 
 input group "=== Анализ ==="
 input ENUM_TIMEFRAMES      InpTrendTF   = PERIOD_H1;
@@ -167,8 +171,8 @@ int OnInit()
    g_day_pnl = 0.0;
    g_trades_today = 0;
 
-   PrintFormat("ProfitScalper v3 Profit Engine | %s | risk=%.2f%% | R=%.2f | ADX>=%.1f",
-               _Symbol, InpRiskPercent, InpRewardRisk, InpMinADX);
+   PrintFormat("ProfitScalper v3.10 | %s | lot=%.2f | maxPos=%d | lock>=$%.2f",
+               _Symbol, InpLot, InpMaxPositions, InpMinProfitMoney);
    return INIT_SUCCEEDED;
   }
 
@@ -206,11 +210,12 @@ void OnTick()
    if(!AnalyzeMarket(score))
       return;
 
-   if(HasOurPosition())
-     {
-      ManageOpenPosition(score);
+   // Сначала фиксируем плюс по всем нашим позициям
+   ManageAllPositions(score);
+
+   const int open_now = CountOurPositions();
+   if(open_now >= InpMaxPositions)
       return;
-     }
 
    if(g_trades_today >= InpMaxTradesDay)
       return;
@@ -233,8 +238,27 @@ void OnTick()
      }
 
    g_last_bar_time = bar;
-   if(OpenTrade(type, score, reason))
-      g_trades_today++;
+
+   int can_open = InpMaxPositions - open_now;
+   int basket = MathMin(InpBasketOpen, can_open);
+   if(basket < 1) basket = 1;
+
+   int opened = 0;
+   for(int i = 0; i < basket; i++)
+     {
+      if(g_trades_today >= InpMaxTradesDay)
+         break;
+      if(OpenTrade(type, score, reason + StringFormat(" #%d", i + 1)))
+        {
+         g_trades_today++;
+         opened++;
+        }
+      else
+         break;
+     }
+   if(opened > 0)
+      PrintFormat("Basket: открыто %d из %d | позиций всего ~%d",
+                  opened, basket, CountOurPositions());
   }
 
 //+------------------------------------------------------------------+
@@ -508,17 +532,24 @@ bool PickEntry(const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
   }
 
 //+------------------------------------------------------------------+
-bool HasOurPosition()
+int CountOurPositions()
   {
+   int n = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
-      return true;
+      n++;
      }
-   return false;
+   return n;
+  }
+
+//+------------------------------------------------------------------+
+bool HasOurPosition()
+  {
+   return CountOurPositions() > 0;
   }
 
 //+------------------------------------------------------------------+
@@ -534,6 +565,12 @@ bool SelectOurPosition(ulong &ticket)
      }
    ticket = 0;
    return false;
+  }
+
+//+------------------------------------------------------------------+
+double PositionProfitMoney()
+  {
+   return PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
   }
 
 //+------------------------------------------------------------------+
@@ -583,11 +620,10 @@ void CalcSLTP(const ENUM_ORDER_TYPE type, const MarketScore &s,
    double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    sl_pts = MathMax(s.atr_pts * InpATR_SL_Mult, InpMinATRPoints);
-   double tp_pts = sl_pts * InpRewardRisk;
 
    // SL не ближе 1.2 спреда
    sl_pts = MathMax(sl_pts, s.spread_pts * 1.2 + 10.0);
-   tp_pts = sl_pts * InpRewardRisk;
+   double tp_pts = sl_pts * InpRewardRisk;
 
    if(type == ORDER_TYPE_BUY)
      {
@@ -622,9 +658,9 @@ bool OpenTrade(const ENUM_ORDER_TYPE type, const MarketScore &s, const string re
 
    if(ok)
      {
-      PrintFormat("OPEN %s lot=%.2f SL=%.0fpts TP=R%.2f | Buy=%d Sell=%d ADX=%.1f | %s | %s",
+      PrintFormat("OPEN %s lot=%.2f SL=%.0fpts | Buy=%d Sell=%d ADX=%.1f | %s",
                   type == ORDER_TYPE_BUY ? "BUY" : "SELL",
-                  lot, sl_pts, InpRewardRisk, s.buy, s.sell, s.adx, s.session_name, reason);
+                  lot, sl_pts, s.buy, s.sell, s.adx, reason);
       return true;
      }
 
@@ -633,10 +669,13 @@ bool OpenTrade(const ENUM_ORDER_TYPE type, const MarketScore &s, const string re
   }
 
 //+------------------------------------------------------------------+
-void ManageOpenPosition(const MarketScore &s)
+void ManageOnePosition(const ulong ticket, const MarketScore &s)
   {
-   ulong ticket;
-   if(!SelectOurPosition(ticket))
+   if(!PositionSelectByTicket(ticket))
+      return;
+   if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+      return;
+   if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic)
       return;
 
    long   type = PositionGetInteger(POSITION_TYPE);
@@ -649,6 +688,16 @@ void ManageOpenPosition(const MarketScore &s)
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    if(point <= 0.0) return;
 
+   double money = PositionProfitMoney();
+
+   // Главное: сразу закрываем, как только плюс достиг порога
+   if(InpCloseOnProfit && money >= InpMinProfitMoney)
+     {
+      if(trade.PositionClose(ticket, InpDeviation))
+         PrintFormat("LOCK PROFIT #%I64u money=%.2f (>= %.2f)", ticket, money, InpMinProfitMoney);
+      return;
+     }
+
    double sl_dist = 0.0;
    if(type == POSITION_TYPE_BUY && sl > 0.0)
       sl_dist = (open - sl) / point;
@@ -660,7 +709,6 @@ void ManageOpenPosition(const MarketScore &s)
    double profit_pts = (type == POSITION_TYPE_BUY) ? (bid - open) / point : (open - ask) / point;
    double r_now = profit_pts / sl_dist;
 
-   // Break-even
    if(InpUseBreakEven && r_now >= InpBE_R)
      {
       double be = 0.0;
@@ -678,7 +726,6 @@ void ManageOpenPosition(const MarketScore &s)
         }
      }
 
-   // Trailing по ATR
    if(InpUseTrailing && r_now >= InpTrailStart_R && s.atr_pts > 0.0)
      {
       double trail_pts = s.atr_pts * InpTrailATR_Mult;
@@ -696,17 +743,28 @@ void ManageOpenPosition(const MarketScore &s)
         }
      }
 
-   // Ранний выход: тренд ослаб и позиция в минусе
    if(InpCloseOnWeakTrend)
      {
       bool weak = (s.adx < InpMinADX * 0.85);
       bool against = (type == POSITION_TYPE_BUY && s.trend_down) ||
                      (type == POSITION_TYPE_SELL && s.trend_up);
-      if(weak && against && profit_pts < 0.0)
+      if(weak && against && money < 0.0)
         {
          if(trade.PositionClose(ticket, InpDeviation))
-            PrintFormat("EXIT weak-trend #%I64u R=%.2f", ticket, r_now);
+            PrintFormat("EXIT weak-trend #%I64u money=%.2f", ticket, money);
         }
+     }
+  }
+
+//+------------------------------------------------------------------+
+void ManageAllPositions(const MarketScore &s)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      ManageOnePosition(ticket, s);
      }
   }
 
@@ -714,9 +772,10 @@ void ManageOpenPosition(const MarketScore &s)
 void UpdatePanel()
   {
    string text = StringFormat(
-                    "ProfitScalper v3\n%s | dayPnL: %.2f | trades: %d/%d\nrisk: %.2f%% | R: %.2f | paused: %s",
-                    _Symbol, g_day_pnl, g_trades_today, InpMaxTradesDay,
-                    InpRiskPercent, InpRewardRisk, g_trading_paused ? "YES" : "no");
+                    "ProfitScalper v3.10\n%s | dayPnL: %.2f | open: %d/%d | dayTrades: %d\nlot=%.2f | lock>=$%.2f | basket=%d | paused: %s",
+                    _Symbol, g_day_pnl, CountOurPositions(), InpMaxPositions, g_trades_today,
+                    InpLot, InpMinProfitMoney, InpBasketOpen,
+                    g_trading_paused ? "YES" : "no");
    Comment(text);
   }
 //+------------------------------------------------------------------+
