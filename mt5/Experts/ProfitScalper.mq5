@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.50 — предикт BUY/SELL по свечам (без залипания в SELL)       |
+//|  v3.60 — мгновенный LOCK каждой плюсовой позиции + долив корзины |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.50"
-#property description "Предсказание стороны по свечам M5/M15/H1 + фарм forex/золото"
+#property version   "3.60"
+#property description "Закрывает КАЖДУЮ плюсовую сразу; долив без ожидания всей корзины"
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -26,7 +26,8 @@ input int                  InpMaxPositions = 5;      // Позиций на ОД
 input int                  InpBasketOpen = 5;        // Открывать за заход
 input int                  InpMaxTradesDay = 300;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 800;
+input int                  InpFarmCooldownMs = 200;  // Быстрый долив после LOCK
+input bool                 InpRefillBasket = true;   // Доливать, не ждя закрытия всех
 
 input group "=== Символы ==="
 input bool                 InpTradeChartSymbol = true;   // Торговать символ графика
@@ -34,9 +35,11 @@ input string               InpAlsoSymbols = "XAUUSD";    // Доп. символ
 input bool                 InpPreferGoldName = true;     // Если XAUUSD нет — искать GOLD/XAU*
 
 input group "=== Фиксация прибыли ==="
-input double               InpMinProfitMoney = 0.30; // Плюс ($) для валют
-input double               InpGoldMinProfit  = 0.80; // Плюс ($) для золота
+input double               InpMinProfitMoney = 0.20; // Плюс ($) для валют — быстрее
+input double               InpGoldMinProfit  = 0.50; // Плюс ($) для золота — быстрее
 input bool                 InpCloseOnProfit  = true;
+input bool                 InpCloseEachAlone = true; // Закрывать каждую плюсовую отдельно
+input int                  InpLockTimerMs    = 100;  // Проверка плюса каждые N мс
 input double               InpRewardRisk = 1.5;
 input bool                 InpUseBreakEven = true;
 input double               InpBE_R = 0.6;
@@ -234,16 +237,21 @@ int OnInit()
    g_day_pnl = 0.0;
    g_trades_today = 0;
 
-   PrintFormat("ProfitScalper v3.50 PREDICT | symbols=%d | lot=%.2f goldLot=%.2f | farm=%s | knowledge=%s",
-               g_sym_count, InpLot, InpGoldLot,
-               InpFarmLoop ? "ON" : "off",
-               InpUseKnowledge ? "ON" : "off");
+   // Быстрый таймер: не зависеть только от тиков графика (золото тоже)
+   int ms = MathMax(InpLockTimerMs, 50);
+   if(!EventSetMillisecondTimer(ms))
+      Print("Timer fail — LOCK только на тиках графика");
+
+   PrintFormat("ProfitScalper v3.60 INSTANT-LOCK | symbols=%d | lockFX=$%.2f gold=$%.2f | timer=%dms | refill=%s",
+               g_sym_count, InpMinProfitMoney, InpGoldMinProfit, ms,
+               InpRefillBasket ? "ON" : "off");
    return INIT_SUCCEEDED;
   }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
+   EventKillTimer();
    for(int i = 0; i < g_sym_count; i++)
      {
       IndicatorRelease(g_ema_fast[i]);
@@ -252,6 +260,20 @@ void OnDeinit(const int reason)
      }
    Comment("");
    Print("ProfitScalper остановлен");
+  }
+
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   // Главное: мгновенная проверка плюса по ВСЕМ символам
+   if(g_trading_paused) return;
+   ManageAllPositions();
+   if(InpFarmLoop && g_trades_today < InpMaxTradesDay)
+     {
+      for(int i = 0; i < g_sym_count; i++)
+         FarmSymbol(i);
+     }
+   UpdatePanel();
   }
 
 //+------------------------------------------------------------------+
@@ -270,7 +292,7 @@ void OnTick()
       return;
      }
 
-   // Фиксация плюса по всем нашим позициям всех символов
+   // Сначала LOCK на каждом тике (еще быстрее реакции)
    ManageAllPositions();
 
    if(g_trades_today >= InpMaxTradesDay)
@@ -288,11 +310,18 @@ void FarmSymbol(const int idx)
   {
    const string sym = g_syms[idx];
    int open_now = CountOurPositions(sym);
-   if(open_now > 0)
-      return; // ждём полного закрытия basket по символу
+
+   // Раньше: ждали закрытия ВСЕХ. Теперь: доливаем до MaxPositions
+   if(!InpRefillBasket)
+     {
+      if(open_now > 0)
+         return;
+     }
+   else if(open_now >= InpMaxPositions)
+      return;
 
    if(g_last_farm_ms[idx] > 0 &&
-      (GetTickCount64() - g_last_farm_ms[idx]) < (ulong)MathMax(InpFarmCooldownMs, 200))
+      (GetTickCount64() - g_last_farm_ms[idx]) < (ulong)MathMax(InpFarmCooldownMs, 50))
       return;
 
    MarketScore score;
@@ -303,7 +332,7 @@ void FarmSymbol(const int idx)
      {
       int max_spread = InpMaxSpreadPts;
       if(IsGoldSymbol(sym))
-         max_spread = MathMax(max_spread, 300); // золото: шире
+         max_spread = MathMax(max_spread, 300);
       if(score.spread_pts > (double)max_spread)
          return;
      }
@@ -312,15 +341,19 @@ void FarmSymbol(const int idx)
    string reason;
    ResolveDir(idx, score, type, reason);
 
-   int basket = MathMin(InpBasketOpen, InpMaxPositions);
-   int opened = OpenBasket(sym, type, score, reason, basket);
+   int need = MathMin(InpBasketOpen, InpMaxPositions - open_now);
+   if(need <= 0)
+      return;
+
+   int opened = OpenBasket(sym, type, score, reason, need);
    if(opened > 0)
      {
       g_last_farm_ms[idx] = GetTickCount64();
       g_last_dir[idx] = type;
       g_have_dir[idx] = true;
-      PrintFormat("FARM %s: +%d %s lot=%.2f", sym, opened,
-                  type == ORDER_TYPE_BUY ? "BUY" : "SELL", LotForSymbol(sym));
+      PrintFormat("FARM %s: +%d %s (open=%d/%d) lot=%.2f", sym, opened,
+                  type == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                  open_now + opened, InpMaxPositions, LotForSymbol(sym));
      }
   }
 
@@ -486,15 +519,52 @@ int CountOurPositions(const string sym = "")
   }
 
 //+------------------------------------------------------------------+
+double PositionMoneyNow(const ulong ticket)
+  {
+   if(!PositionSelectByTicket(ticket)) return -1e9;
+   // Floating P/L брокера
+   double money = PositionGetDouble(POSITION_PROFIT)
+                  + PositionGetDouble(POSITION_SWAP);
+
+   // Дополнительно считаем по тику — иногда PROFIT обновляется медленнее UI
+   string sym = PositionGetString(POSITION_SYMBOL);
+   long type = PositionGetInteger(POSITION_TYPE);
+   double open = PositionGetDouble(POSITION_PRICE_OPEN);
+   double vol  = PositionGetDouble(POSITION_VOLUME);
+   double tick_val = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double tick_sz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(tick_sz > 0.0 && tick_val > 0.0)
+     {
+      double price = (type == POSITION_TYPE_BUY) ? bid : ask;
+      double pts = (type == POSITION_TYPE_BUY) ? (price - open) : (open - price);
+      double calc = (pts / tick_sz) * tick_val * vol;
+      // берём более «свежую» оценку вверх для lock (быстрее реакция на плюс)
+      if(calc > money)
+         money = calc;
+     }
+   return money;
+  }
+
+//+------------------------------------------------------------------+
 void ManageAllPositions()
   {
+   // Копия тикетов — после Close индексы плывут
+   ulong tickets[];
+   ArrayResize(tickets, 0);
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
       if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
-      ManageOne(ticket);
+      int n = ArraySize(tickets);
+      ArrayResize(tickets, n + 1);
+      tickets[n] = ticket;
      }
+
+   for(int i = 0; i < ArraySize(tickets); i++)
+      ManageOne(tickets[i]);
   }
 
 //+------------------------------------------------------------------+
@@ -502,23 +572,27 @@ void ManageOne(const ulong ticket)
   {
    if(!PositionSelectByTicket(ticket)) return;
    string sym = PositionGetString(POSITION_SYMBOL);
-   double money = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   double money = PositionMoneyNow(ticket);
    double lock_at = MinProfitForSymbol(sym);
 
-   if(InpCloseOnProfit && money >= lock_at)
+   // Каждая позиция сама по себе — без ожидания остальных
+   if(InpCloseOnProfit && InpCloseEachAlone && money >= lock_at)
      {
       if(trade.PositionClose(ticket, InpDeviation))
         {
-         // cooldown по символу
+         // Короткий cooldown только для долития, не блокирует другие LOCK
          for(int i = 0; i < g_sym_count; i++)
             if(g_syms[i] == sym)
                g_last_farm_ms[i] = GetTickCount64();
-         PrintFormat("LOCK %s #%I64u +%.2f (need %.2f)", sym, ticket, money, lock_at);
+         PrintFormat("LOCK NOW %s #%I64u +%.2f (>=%.2f) alone", sym, ticket, money, lock_at);
         }
+      else
+         PrintFormat("LOCK FAIL %s #%I64u +%.2f ret=%d %s",
+                     sym, ticket, money, trade.ResultRetcode(), trade.ResultRetcodeDescription());
       return;
      }
 
-   // BE / trailing
+   // BE / trailing — только если ещё не в зоне мгновенного lock
    long type = PositionGetInteger(POSITION_TYPE);
    double open = PositionGetDouble(POSITION_PRICE_OPEN);
    double sl = PositionGetDouble(POSITION_SL);
@@ -552,7 +626,6 @@ void ManageOne(const ulong ticket)
 
    if(InpUseTrailing && r_now >= InpTrailStart_R)
      {
-      // ATR-приближение: trail ~ 0.8 * текущий диапазон из sl_dist базового
       double trail_pts = sl_dist * InpTrailATR_Mult * 0.5;
       if(type == POSITION_TYPE_BUY)
         {
@@ -626,11 +699,11 @@ void UpdatePanel()
       list += g_syms[i] + "(" + IntegerToString(CountOurPositions(g_syms[i])) + ")";
      }
    Comment(StringFormat(
-              "ProfitScalper v3.50 PREDICT\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | farm=%s | KB=%s | pause=%s",
+              "ProfitScalper v3.60 INSTANT-LOCK\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f gold=%.2f\nlock FX>=$%.2f GOLD>=$%.2f | eachAlone=%s refill=%s | pause=%s",
               list, g_day_pnl, g_trades_today, InpLot, InpGoldLot,
               InpMinProfitMoney, InpGoldMinProfit,
-              InpFarmLoop ? "ON" : "off",
-              InpUseKnowledge ? "ON" : "off",
+              InpCloseEachAlone ? "YES" : "no",
+              InpRefillBasket ? "ON" : "off",
               g_trading_paused ? "YES" : "no"));
   }
 //+------------------------------------------------------------------+
