@@ -17,9 +17,12 @@ v3 делает наоборот:
 
 ## Установка
 
-1. Скопировать `mt5/Experts/ProfitScalper.mq5` → `MQL5/Experts/`
-2. Compile (F7) в MetaEditor
-3. На график + **Algo Trading ON**
+Готовый бинарник уже скомпилирован: `mt5/Experts/ProfitScalper.ex5`  
+*(Result: 0 errors, 0 warnings)*
+
+1. Скопировать **`ProfitScalper.ex5`** (или `.mq5`) → `MQL5/Experts/`
+2. Если брал `.mq5` — Compile (F7) в MetaEditor
+3. В MT5 обновить Навигатор → перетащить на график + **Algo Trading ON**
 4. Подстроить часы сессий под **время сервера брокера**
 
 ## Ключевые настройки
