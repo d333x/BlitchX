@@ -191,51 +191,45 @@ bool EveningStarLike(const string sym, const ENUM_TIMEFRAMES tf)
 
 //+------------------------------------------------------------------+
 void AddTFVotes(const string sym, const ENUM_TIMEFRAMES tf, const string tag,
-                KnowledgeScore &s)
+                const double w, KnowledgeScore &s)
   {
    CandleFacts cur, prev;
    if(!FillCandle(sym, tf, 1, cur) || !FillCandle(sym, tf, 2, prev))
       return;
 
-   // цвет + сила тела
-   double body_w = 1.0 + cur.body_ratio * 2.0;
+   double body_w = (1.0 + cur.body_ratio * 2.0) * w;
    if(cur.bull) { s.buy  += body_w; s.reason += tag + "bull "; }
    if(cur.bear) { s.sell += body_w; s.reason += tag + "bear "; }
 
-   // закрытие в верхней/нижней четверти диапазона
-   if(cur.close_loc >= 0.75) { s.buy  += 1.5; s.reason += tag + "closeHi "; }
-   if(cur.close_loc <= 0.25) { s.sell += 1.5; s.reason += tag + "closeLo "; }
+   if(cur.close_loc >= 0.75) { s.buy  += 1.5 * w; s.reason += tag + "closeHi "; }
+   if(cur.close_loc <= 0.25) { s.sell += 1.5 * w; s.reason += tag + "closeLo "; }
 
-   // импульс тел
    double impulse = BodyImpulse(sym, tf, 5);
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    if(point <= 0.0) point = 1e-10;
    double imp_pts = impulse / point;
-   if(imp_pts > 20)  { s.buy  += MathMin(4.0, imp_pts / 40.0); s.reason += tag + "imp↑ "; }
-   if(imp_pts < -20) { s.sell += MathMin(4.0, -imp_pts / 40.0); s.reason += tag + "imp↓ "; }
+   if(imp_pts > 20)  { s.buy  += MathMin(4.0, imp_pts / 40.0) * w; s.reason += tag + "imp↑ "; }
+   if(imp_pts < -20) { s.sell += MathMin(4.0, -imp_pts / 40.0) * w; s.reason += tag + "imp↓ "; }
 
-   // наклон close
    double slope = CloseSlope(sym, tf, 4);
    double sl_pts = slope / point;
-   if(sl_pts > 15)  { s.buy  += 1.5; s.reason += tag + "slope↑ "; }
-   if(sl_pts < -15) { s.sell += 1.5; s.reason += tag + "slope↓ "; }
+   if(sl_pts > 15)  { s.buy  += 1.5 * w; s.reason += tag + "slope↑ "; }
+   if(sl_pts < -15) { s.sell += 1.5 * w; s.reason += tag + "slope↓ "; }
 
-   // доля бычьих свечей
    double br = BullRatio(sym, tf, 8);
-   if(br >= 0.625) { s.buy  += 2.0; s.reason += tag + "maj↑ "; }
-   if(br <= 0.375) { s.sell += 2.0; s.reason += tag + "maj↓ "; }
+   if(br >= 0.625) { s.buy  += 2.0 * w; s.reason += tag + "maj↑ "; }
+   if(br <= 0.375) { s.sell += 2.0 * w; s.reason += tag + "maj↓ "; }
 
-   // классические паттерны
-   if(IsHammer(cur))          { s.buy  += 3.0; s.reason += tag + "hammer "; }
-   if(IsShootingStar(cur))    { s.sell += 3.0; s.reason += tag + "star "; }
-   if(IsBullEngulf(prev, cur)){ s.buy  += 4.0; s.reason += tag + "eng↑ "; }
-   if(IsBearEngulf(prev, cur)){ s.sell += 4.0; s.reason += tag + "eng↓ "; }
-   if(MorningStarLike(sym, tf)){ s.buy  += 3.0; s.reason += tag + "mStar "; }
-   if(EveningStarLike(sym, tf)){ s.sell += 3.0; s.reason += tag + "eStar "; }
-   if(ThreeSoldiers(sym, tf)) { s.buy  += 3.5; s.reason += tag + "3sol "; }
-   if(ThreeCrows(sym, tf))    { s.sell += 3.5; s.reason += tag + "3crow "; }
-   if(StructureBull(sym, tf)) { s.buy  += 2.5; s.reason += tag + "HHHL "; }
-   if(StructureBear(sym, tf)) { s.sell += 2.5; s.reason += tag + "LHLL "; }
+   if(IsHammer(cur))          { s.buy  += 3.0 * w; s.reason += tag + "hammer "; }
+   if(IsShootingStar(cur))    { s.sell += 3.0 * w; s.reason += tag + "star "; }
+   if(IsBullEngulf(prev, cur)){ s.buy  += 4.0 * w; s.reason += tag + "eng↑ "; }
+   if(IsBearEngulf(prev, cur)){ s.sell += 4.0 * w; s.reason += tag + "eng↓ "; }
+   if(MorningStarLike(sym, tf)){ s.buy  += 3.0 * w; s.reason += tag + "mStar "; }
+   if(EveningStarLike(sym, tf)){ s.sell += 3.0 * w; s.reason += tag + "eStar "; }
+   if(ThreeSoldiers(sym, tf)) { s.buy  += 3.5 * w; s.reason += tag + "3sol "; }
+   if(ThreeCrows(sym, tf))    { s.sell += 3.5 * w; s.reason += tag + "3crow "; }
+   if(StructureBull(sym, tf)) { s.buy  += 2.5 * w; s.reason += tag + "HHHL "; }
+   if(StructureBear(sym, tf)) { s.sell += 2.5 * w; s.reason += tag + "LHLL "; }
   }
 
 //+------------------------------------------------------------------+
@@ -247,16 +241,15 @@ KnowledgeScore EvaluateKnowledge(const string sym,
    KnowledgeScore s;
    s.buy = 0; s.sell = 0; s.reason = "";
 
-   // Голоса EMA с графика анализа
-   if(trend_up)   { s.buy  += 4.0; s.reason += "EMA↑ "; }
-   if(trend_down) { s.sell += 4.0; s.reason += "EMA↓ "; }
+   // Старший тренд важнее (иначе M5 «шум» перебивает H1)
+   if(trend_up)   { s.buy  += 8.0; s.reason += "H1-EMA↑ "; }
+   if(trend_down) { s.sell += 8.0; s.reason += "H1-EMA↓ "; }
 
-   // Мульти-ТФ: быстрый + сигнал + старший
-   AddTFVotes(sym, PERIOD_M5,  "M5:", s);
-   AddTFVotes(sym, signal_tf,  "SIG:", s);          // обычно M15
-   AddTFVotes(sym, PERIOD_H1,  "H1:", s);
+   // Вес: M5 слабый, M15 средний, H1 сильный
+   AddTFVotes(sym, PERIOD_M5,  "M5:", 0.45, s);
+   AddTFVotes(sym, signal_tf,  "M15:", 1.00, s);
+   AddTFVotes(sym, PERIOD_H1,  "H1:", 2.20, s);
 
-   // Цена относительно недавнего mid диапазона H1
    double h[], l[], c[];
    ArraySetAsSeries(h, true);
    ArraySetAsSeries(l, true);
@@ -268,8 +261,8 @@ KnowledgeScore EvaluateKnowledge(const string sym,
       double hi = h[ArrayMaximum(h, 0, 20)];
       double lo = l[ArrayMinimum(l, 0, 20)];
       double mid = (hi + lo) * 0.5;
-      if(c[0] > mid) { s.buy  += 2.0; s.reason += "aboveMid "; }
-      else           { s.sell += 2.0; s.reason += "belowMid "; }
+      if(c[0] > mid) { s.buy  += 4.0; s.reason += "aboveMidH1 "; }
+      else           { s.sell += 4.0; s.reason += "belowMidH1 "; }
      }
 
    if(s.reason == "")

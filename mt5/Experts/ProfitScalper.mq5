@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.70 — один символ графика + предикт большой прибыли           |
+ //|  v3.72 — анализ свечей; конфликт EMA не зеркалит направление     |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.70"
-#property description "Только символ графика. Предикт вверх/вниз → цель на крупный плюс"
+#property version   "3.72"
+#property description "Анализ свечей H1>M15>M5. Не рандом. Конфликт EMA→ждём, не зеркалим"
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -63,6 +63,8 @@ input int                  InpMaxSpreadPts = 300;      // золото
 input group "=== База знаний ==="
 input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
+input bool                 InpSkipH1Conflict = true; // Слабый конфликт EMA↔свечи → ждать
+input double               InpConflictFollowGap = 8.0; // Если разрыв баллов >= этого — идём по свечам (не ждём EMA)
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
@@ -80,12 +82,17 @@ int    g_ema_fast[MAX_SYMS];
 int    g_ema_slow[MAX_SYMS];
 int    g_atr[MAX_SYMS];
 ulong  g_last_farm_ms[MAX_SYMS];
+ulong  g_last_skip_ms[MAX_SYMS];
 ENUM_ORDER_TYPE g_last_dir[MAX_SYMS];
 bool   g_have_dir[MAX_SYMS];
-double g_pred_gap[MAX_SYMS];      // |buy-sell| последнего предикта
-bool   g_pred_strong[MAX_SYMS];   // сильный предикт → большая цель
-double g_lock_target[MAX_SYMS];   // $ цель фиксации для символа
-string g_pred_side[MAX_SYMS];     // "BUY"/"SELL" текст для панели
+double g_pred_gap[MAX_SYMS];
+bool   g_pred_strong[MAX_SYMS];
+double g_lock_target[MAX_SYMS];
+string g_pred_side[MAX_SYMS];
+double g_score_buy[MAX_SYMS];
+double g_score_sell[MAX_SYMS];
+string g_score_why[MAX_SYMS];
+string g_wait_why[MAX_SYMS];
 
 datetime g_day_start = 0;
 double   g_day_pnl = 0.0;
@@ -230,12 +237,17 @@ int OnInit()
       g_ema_slow[i] = iMA(g_syms[i], InpTrendTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
       g_atr[i]      = iATR(g_syms[i], InpSignalTF, InpATRPeriod);
       g_last_farm_ms[i] = 0;
+      g_last_skip_ms[i] = 0;
       g_last_dir[i] = ORDER_TYPE_BUY;
       g_have_dir[i] = false;
       g_pred_gap[i] = 0;
       g_pred_strong[i] = false;
       g_lock_target[i] = InpMinProfitMoney;
       g_pred_side[i] = "?";
+      g_score_buy[i] = 0;
+      g_score_sell[i] = 0;
+      g_score_why[i] = "-";
+      g_wait_why[i] = "";
       if(g_ema_fast[i] == INVALID_HANDLE || g_ema_slow[i] == INVALID_HANDLE || g_atr[i] == INVALID_HANDLE)
         {
          PrintFormat("Индикаторы не созданы для %s", g_syms[i]);
@@ -253,8 +265,8 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.70 GOLD-PRED | chart=%s | lot=%.2f | min$=%.2f big$=%.2f | strongGap=%.1f",
-               _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney, InpStrongScoreGap);
+   PrintFormat("ProfitScalper v3.72 ANALYSIS | chart=%s | lot=%.2f | min$=%.2f big$=%.2f | conflict=SKIP (не зеркалим)",
+               _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney);
    return INIT_SUCCEEDED;
   }
 
@@ -321,7 +333,15 @@ void FarmSymbol(const int idx)
    const string sym = g_syms[idx];
    int open_now = CountOurPositions(sym);
 
-   // Раньше: ждали закрытия ВСЕХ. Теперь: доливаем до MaxPositions
+   MarketScore score;
+   if(!AnalyzeSymbol(idx, score))
+      return;
+
+   // Всегда обновляем анализ в панели даже при полной корзине
+   ENUM_ORDER_TYPE type;
+   string reason;
+   bool can_trade = ResolveDir(idx, score, type, reason);
+
    if(!InpRefillBasket)
      {
       if(open_now > 0)
@@ -330,12 +350,11 @@ void FarmSymbol(const int idx)
    else if(open_now >= InpMaxPositions)
       return;
 
-   if(g_last_farm_ms[idx] > 0 &&
-      (GetTickCount64() - g_last_farm_ms[idx]) < (ulong)MathMax(InpFarmCooldownMs, 50))
+   if(!can_trade)
       return;
 
-   MarketScore score;
-   if(!AnalyzeSymbol(idx, score))
+   if(g_last_farm_ms[idx] > 0 &&
+      (GetTickCount64() - g_last_farm_ms[idx]) < (ulong)MathMax(InpFarmCooldownMs, 50))
       return;
 
    if(InpUseSpreadFilter)
@@ -347,10 +366,6 @@ void FarmSymbol(const int idx)
          return;
      }
 
-   ENUM_ORDER_TYPE type;
-   string reason;
-   ResolveDir(idx, score, type, reason);
-
    int need = MathMin(InpBasketOpen, InpMaxPositions - open_now);
    if(need <= 0)
       return;
@@ -361,6 +376,7 @@ void FarmSymbol(const int idx)
       g_last_farm_ms[idx] = GetTickCount64();
       g_last_dir[idx] = type;
       g_have_dir[idx] = true;
+      g_wait_why[idx] = "";
       PrintFormat("FARM %s: +%d %s (open=%d/%d) lot=%.2f", sym, opened,
                   type == ORDER_TYPE_BUY ? "BUY" : "SELL",
                   open_now + opened, InpMaxPositions, LotForSymbol(sym));
@@ -423,44 +439,73 @@ void UpdatePrediction(const int idx, const MarketScore &s)
   }
 
 //+------------------------------------------------------------------+
-void ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
+// true = можно открывать; false = ждём (анализ всё равно в панели)
+bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
   {
+   g_wait_why[idx] = "";
+
    if(InpDirection == DIR_BUY)
-     { type = ORDER_TYPE_BUY; reason = "fixed BUY"; return; }
+     { type = ORDER_TYPE_BUY; reason = "fixed BUY"; g_pred_side[idx]="UP/BUY"; return true; }
    if(InpDirection == DIR_SELL)
-     { type = ORDER_TYPE_SELL; reason = "fixed SELL"; return; }
+     { type = ORDER_TYPE_SELL; reason = "fixed SELL"; g_pred_side[idx]="DOWN/SELL"; return true; }
 
    if(InpUseKnowledge)
      {
       KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
-      double diff = MathAbs(ks.buy - ks.sell);
-      g_pred_gap[idx] = diff;
-      g_pred_strong[idx] = (InpSmartBigProfit && diff >= InpStrongScoreGap);
-      g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
-
-      if(InpKnowledgeGap > 0 && diff < (double)InpKnowledgeGap && InpStickyLastDir && g_have_dir[idx])
-        {
-         type = g_last_dir[idx];
-         reason = StringFormat("PRED weak→last %s (%.1f/%.1f) %s",
-                               type == ORDER_TYPE_BUY ? "BUY" : "SELL",
-                               ks.buy, ks.sell, ks.reason);
-         g_pred_side[idx] = (type == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
-         return;
-        }
+      g_score_buy[idx] = ks.buy;
+      g_score_sell[idx] = ks.sell;
+      g_score_why[idx] = ks.reason;
 
       KnowledgeForceDirWithTieBreak(g_syms[idx], ks, type, reason);
+
+      // Конфликт: EMA H1 против баллов свечей.
+      // РАНЬШЕ зеркалили (BUY→SELL) — это давало минус при росте золота.
+      // СЕЙЧАС: не зеркалим. Либо ждём согласованности, либо идём по баллам soft.
+      bool conflict = ((type == ORDER_TYPE_SELL && s.trend_up) ||
+                       (type == ORDER_TYPE_BUY  && s.trend_down));
+
+      double diff = MathAbs(g_score_buy[idx] - g_score_sell[idx]);
+      g_pred_gap[idx] = diff;
       g_pred_side[idx] = (type == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
-      if(g_pred_strong[idx])
-         reason = "BIG " + reason + StringFormat(" target$%.2f", g_lock_target[idx]);
-      else
-         reason = reason + StringFormat(" target$%.2f", g_lock_target[idx]);
-      return;
+
+      if(conflict && InpSkipH1Conflict && diff < InpConflictFollowGap)
+        {
+         g_pred_strong[idx] = false;
+         g_lock_target[idx] = InpMinProfitMoney;
+         g_wait_why[idx] = StringFormat(
+            "ЖДЁМ: слабый сигнал (gap %.1f < %.1f) + H1-EMA против %s. Не зеркалим.",
+            diff, InpConflictFollowGap, g_pred_side[idx]);
+         if(g_last_skip_ms[idx] == 0 ||
+            (GetTickCount64() - g_last_skip_ms[idx]) >= 5000)
+           {
+            g_last_skip_ms[idx] = GetTickCount64();
+            PrintFormat("SKIP %s | %s | BUY=%.1f SELL=%.1f | %s",
+                        g_syms[idx], g_wait_why[idx],
+                        g_score_buy[idx], g_score_sell[idx], ks.reason);
+           }
+         reason = "SKIP weak-conflict " + reason;
+         return false;
+        }
+
+      // Сильный перевес свечей → идём по баллам (раньше зеркалили в SELL — ошибка)
+      if(conflict)
+         reason = "FOLLOW candles (EMA soft) " + reason;
+
+      g_pred_strong[idx] = (InpSmartBigProfit && !conflict && diff >= InpStrongScoreGap);
+      g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
+      g_wait_why[idx] = "";
+
+      reason = StringFormat("%s | BUY=%.1f SELL=%.1f lock$=%.2f%s",
+                            reason, g_score_buy[idx], g_score_sell[idx],
+                            g_lock_target[idx],
+                            g_pred_strong[idx] ? " BIG" : (conflict ? " soft(H1)" : ""));
+      return true;
      }
 
    if(s.trend_up)
-     { type = ORDER_TYPE_BUY; g_pred_side[idx]="UP/BUY"; reason = "trend UP"; return; }
+     { type = ORDER_TYPE_BUY; g_pred_side[idx]="UP/BUY"; reason = "trend UP"; return true; }
    if(s.trend_down)
-     { type = ORDER_TYPE_SELL; g_pred_side[idx]="DOWN/SELL"; reason = "trend DN"; return; }
+     { type = ORDER_TYPE_SELL; g_pred_side[idx]="DOWN/SELL"; reason = "trend DN"; return true; }
 
    double imp = BodyImpulse(g_syms[idx], PERIOD_M5, 3);
    if(imp >= 0.0)
@@ -468,6 +513,7 @@ void ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
    else
      { type = ORDER_TYPE_SELL; g_pred_side[idx]="DOWN/SELL"; reason = "M5 impulse↓"; }
    g_lock_target[idx] = InpMinProfitMoney;
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -507,7 +553,13 @@ bool OpenTrade(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &
      }
 
    double lot = NormalizeLot(sym, LotForSymbol(sym));
-   string comment = g_pred_strong[idx] ? "PE BIG" : "PE Pred";
+   // Комментарий виден на телефоне во вкладке Торговля
+   string comment = StringFormat("%s %.0f>%.0f",
+                                 type == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                                 type == ORDER_TYPE_BUY ? g_score_buy[idx] : g_score_sell[idx],
+                                 type == ORDER_TYPE_BUY ? g_score_sell[idx] : g_score_buy[idx]);
+   if(StringLen(comment) > 31)
+      comment = StringSubstr(comment, 0, 31);
 
    bool ok = (type == ORDER_TYPE_BUY)
              ? trade.Buy(lot, sym, 0.0, sl, tp, comment)
@@ -748,17 +800,19 @@ void UpdatePanel()
    string list = "";
    for(int i = 0; i < g_sym_count; i++)
      {
-      if(i > 0) list += "\n";
-      list += StringFormat("%s(%d) pred=%s gap=%.1f lock$=%.2f%s",
-                           g_syms[i], CountOurPositions(g_syms[i]),
-                           g_pred_side[i], g_pred_gap[i], g_lock_target[i],
-                           g_pred_strong[i] ? " BIG" : "");
+      if(i > 0) list += "\n----\n";
+      string wait = (g_wait_why[i] != "" ? ("\n" + g_wait_why[i]) : "");
+      list += StringFormat(
+                 "%s  pos=%d\nАНАЛИЗ СВЕЧЕЙ (не рандом):\nBUY %.1f  vs  SELL %.1f  →  %s%s\nцель lock $%.2f | gap %.1f\n%s%s",
+                 g_syms[i], CountOurPositions(g_syms[i]),
+                 g_score_buy[i], g_score_sell[i], g_pred_side[i],
+                 g_pred_strong[i] ? " [BIG]" : "",
+                 g_lock_target[i], g_pred_gap[i],
+                 g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.70 CHART-ONLY\n%s\ndayPnL: %.2f | trades: %d | lot=%.2f\nmin$=%.2f big$=%.2f | refill=%s | pause=%s",
+              "ProfitScalper v3.72 — анализ графика\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nТел.: вкладка Чарт + комментарий ордера BUY/SELL x>y",
               list, g_day_pnl, g_trades_today, InpLot,
-              InpMinProfitMoney, InpBigProfitMoney,
-              InpRefillBasket ? "ON" : "off",
               g_trading_paused ? "YES" : "no"));
   }
 //+------------------------------------------------------------------+
