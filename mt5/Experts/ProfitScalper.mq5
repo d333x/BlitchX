@@ -33,12 +33,12 @@ enum ENUM_LOT_MODE
 
 input group "=== Торговля ==="
 input ENUM_TRADE_DIRECTION InpDirection = DIR_AUTO;
-input ENUM_LOT_MODE        InpLotMode   = LOT_RISK;
+input ENUM_LOT_MODE        InpLotMode   = LOT_FIXED;
 input double               InpLot       = 0.01;      // Лот (если Fixed)
 input double               InpRiskPercent = 1.0;     // Риск на сделку, % депозита
 input int                  InpMagic     = 26071403;
 input int                  InpDeviation = 30;
-input int                  InpMaxTradesDay = 8;      // Макс. сделок за день
+input int                  InpMaxTradesDay = 20;      // Макс. сделок за день
 
 input group "=== Цель прибыли (R-модуль) ==="
 input double               InpRewardRisk = 2.0;      // TP = SL * R (цель > риска)
@@ -56,9 +56,9 @@ input int                  InpFastEMA   = 20;
 input int                  InpSlowEMA   = 50;
 input int                  InpRSIPeriod = 14;
 input int                  InpADXPeriod = 14;
-input double               InpMinADX    = 22.0;      // Минимальная сила тренда
-input int                  InpMinScore  = 5;
-input int                  InpScoreGap  = 2;
+input double               InpMinADX    = 15.0;      // Минимальная сила тренда
+input int                  InpMinScore  = 3;
+input int                  InpScoreGap  = 1;
 
 input group "=== Фильтры ==="
 input bool                 InpUseSpreadFilter = true;
@@ -70,7 +70,7 @@ input double               InpMaxATRPoints    = 800.0;
 input bool                 InpPullbackEntry   = true; // Вход на откате к EMA
 
 input group "=== Сессии (время сервера брокера) ==="
-input ENUM_SESSION_MODE    InpSessionMode = SESSION_BEST;
+input ENUM_SESSION_MODE    InpSessionMode = SESSION_ALL;
 input int                  InpLondonStart = 8;
 input int                  InpLondonEnd   = 17;
 input int                  InpNYStart     = 13;
