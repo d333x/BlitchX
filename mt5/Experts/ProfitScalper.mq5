@@ -293,14 +293,10 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool FarmFiltersPass(const MarketScore &s, string &reason)
   {
-   if(InpUseSpreadFilter && s.spread_pts > (double)InpMaxSpreadPts)
+   // В фарм-режиме почти не стопаем — только совсем широкий спред
+   if(InpUseSpreadFilter && s.spread_pts > (double)MathMax(InpMaxSpreadPts * 3, 60))
      {
-      reason = StringFormat("спред %.0f", s.spread_pts);
-      return false;
-     }
-   if(s.atr_pts < InpMinATRPoints * 0.5)
-     {
-      reason = StringFormat("мертвый рынок ATR %.0f", s.atr_pts);
+      reason = StringFormat("спред слишком широкий %.0f", s.spread_pts);
       return false;
      }
    return true;
