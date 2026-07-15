@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.90 — профит-режим: качественный вход, 1 позиция, быстрый lock  |
- //+------------------------------------------------------------------+
+//|  v3.91 — СУММА $: lock > cut. Приход должен бить расход.           |
+//+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.90"
-#property description "Профит: вход только M1+M5+H1 вместе. 0.05 лот. Lock $1.5. Без входа против M1."
+#property version   "3.91"
+#property description "Сумма$: lock$4 cut$2.5. Без ранних H1-wick cut. Важно net$, не число плюсов."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -25,18 +25,19 @@ input int                  InpMaxPositions = 1;      // Одна позиция 
 input int                  InpBasketOpen = 1;
 input int                  InpMaxTradesDay = 300;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 4000; // Не ревенж-вход сразу после сделки
+input int                  InpFarmCooldownMs = 8000; // Пауза после любой сделки
+input int                  InpLossCooldownMs = 90000; // После минуса — долго не ревенжим
 input bool                 InpRefillBasket = false;  // Не доливать
 
 input group "=== Символ ==="
 input bool                 InpTradeOnlyChart = true;
 input string               InpAlsoSymbols = "";
 
-input group "=== Предикт прибыли ==="
+input group "=== Предикт прибыли (СУММА $) ==="
 input bool                 InpUseKnowledge = true;
 input bool                 InpSmartBigProfit = true;
-input double               InpMinProfitMoney = 1.50;   // Забираем плюс раньше/увереннее
-input double               InpBigProfitMoney = 4.00;
+input double               InpMinProfitMoney = 4.00;   // Один плюс > одного cut ($2.5)
+input double               InpBigProfitMoney = 7.00;   // Сильный ход — держим больше $
 input double               InpStrongScoreGap = 8.0;
 input double               InpStrongRR = 2.5;
 input double               InpWeakRR = 1.2;
@@ -56,7 +57,7 @@ input ENUM_TIMEFRAMES      InpSignalTF  = PERIOD_M15;
 input int                  InpFastEMA   = 20;
 input int                  InpSlowEMA   = 50;
 input int                  InpATRPeriod = 14;
-input double               InpATR_SL_Mult = 1.2;       // Ближе SL на качественном входе
+input double               InpATR_SL_Mult = 1.0;       // Ближе SL → меньше расход до cut
 input bool                 InpUseSpreadFilter = true;
 input int                  InpMaxSpreadPts = 500;
 
@@ -64,14 +65,15 @@ input group "=== База знаний ==="
 input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
 input bool                 InpRequireClearFlow = true;
-input bool                 InpCloseAgainstFlow = true;
-input double               InpBasketCutLoss = 7.0;     // Под 0.05 лот: режем быстрее маленький минус
+input bool                 InpCloseAgainstFlow = false; // Не режем фитилём H1 — только по $ cut
+input double               InpBasketCutLoss = 2.50;    // ВСЕГДА < InpMinProfitMoney (ожидание +$)
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
-input double               InpMaxLossMoney = 250.0;
+input double               InpMaxLossMoney = 40.0;     // Стоп дня раньше, пока расход > прихода
 input bool                 InpMaxLossPct = false;
 input double               InpMaxLossPercent = 5.0;
+input bool                 InpPauseIfExpenseLeads = true; // Если расход > приход — пауза
 
 #define MAX_SYMS 8
 
@@ -99,9 +101,12 @@ ulong  g_last_pulse_ms = 0;
 
 datetime g_day_start = 0;
 double   g_day_pnl = 0.0;
+double   g_day_income = 0.0;   // сумма плюсовых закрытий ($)
+double   g_day_expense = 0.0;  // сумма минусовых закрытий ($) — расход
 double   g_day_start_balance = 0.0;
 bool     g_trading_paused = false;
 int      g_trades_today = 0;
+int      g_loss_streak = 0;
 
 struct MarketScore
   {
@@ -263,13 +268,20 @@ int OnInit()
    g_day_start = DayStart();
    g_day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_day_pnl = 0.0;
+   g_day_income = 0.0;
+   g_day_expense = 0.0;
    g_trades_today = 0;
+   g_loss_streak = 0;
+
+   if(InpBasketCutLoss >= InpMinProfitMoney)
+      PrintFormat("WARN: cut=$%.2f >= lock=$%.2f — расход будет бить приход. Нужен cut < lock.",
+                  InpBasketCutLoss, InpMinProfitMoney);
 
    int ms = MathMax(InpLockTimerMs, 50);
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.90 PROFIT | chart=%s | lot=%.2f | lock$=%.2f | cut=$%.1f | maxPos=%d",
+   PrintFormat("ProfitScalper v3.91 SUM$ | chart=%s | lot=%.2f | lock$=%.2f | cut=$%.2f | maxPos=%d (цель: приход>расход)",
                _Symbol, InpLot, InpMinProfitMoney, InpBasketCutLoss, InpMaxPositions);
    g_last_pulse_ms = 0;
    return INIT_SUCCEEDED;
@@ -302,12 +314,13 @@ void PulseAlive()
    MarketFlow flow = ReadMarketFlow(sym);
    int open_n = CountOurPositions(sym);
    PrintFormat(
-      "PULSE %s | %s clear=%s B%d/S%d open=%d dayPnL=%.2f trades=%d pause=%s | %s",
+      "PULSE %s | %s clear=%s B%d/S%d open=%d | net$=%.2f приход$=%.2f расход$=%.2f trades=%d pause=%s | %s",
       sym,
       flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
       flow.clear ? "YES" : "no",
       flow.buy_v, flow.sell_v, open_n,
-      g_day_pnl, g_trades_today,
+      g_day_pnl, g_day_income, g_day_expense,
+      g_trades_today,
       g_trading_paused ? "YES" : "no",
       flow.reason);
   }
@@ -657,7 +670,7 @@ int CloseOurSymbol(const string sym, const string why)
   }
 
 //+------------------------------------------------------------------+
-// Если рынок развернулся против открытых — режем. Не доливаем против хода.
+// Cut только по сумме $ (cut < lock). Без H1-wick серии мелких минусов.
 void ProtectAgainstFlow(const int idx)
   {
    const string sym = g_syms[idx];
@@ -669,14 +682,14 @@ void ProtectAgainstFlow(const int idx)
    if(basket <= -MathAbs(InpBasketCutLoss))
      {
       CloseOurSymbol(sym, StringFormat("basket loss $%.2f <= -%.2f", basket, InpBasketCutLoss));
-      g_pause_until_ms[idx] = GetTickCount64() + 20000; // не ревенж сразу
+      g_pause_until_ms[idx] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 30000);
       return;
      }
 
+   // Опционально: закрытый H1 против нас + глубокий минус — тот же $ порог
    if(!InpCloseAgainstFlow)
       return;
 
-   // Какая сторона у нас открыта?
    int our = -1;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -691,33 +704,15 @@ void ProtectAgainstFlow(const int idx)
       return;
 
    MarketFlow flow = ReadMarketFlow(sym);
+   bool closed_h1_vs =
+      (our == POSITION_TYPE_BUY  && StringFind(flow.reason, "H1cl↓") >= 0) ||
+      (our == POSITION_TYPE_SELL && StringFind(flow.reason, "H1cl↑") >= 0);
 
-   bool against = ((our == POSITION_TYPE_BUY && flow.dir == ORDER_TYPE_SELL) ||
-                   (our == POSITION_TYPE_SELL && flow.dir == ORDER_TYPE_BUY));
-
-   // Режем по H1 только если уже в минусе (не выбивать плюс фитилём)
-   bool candles_vs =
-      (our == POSITION_TYPE_BUY  && StringFind(flow.reason, "H1now↓") >= 0) ||
-      (our == POSITION_TYPE_SELL && StringFind(flow.reason, "H1now↑") >= 0);
-
-   if(!InpCloseAgainstFlow)
-      return;
-
-   if(against && flow.clear && basket < -1.5)
+   if(closed_h1_vs && basket <= -MathAbs(InpBasketCutLoss))
      {
       CloseOurSymbol(sym, StringFormat(
-         "против потока %s B%d/S%d basket=$%.2f | %s",
-         flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
-         flow.buy_v, flow.sell_v, basket, flow.reason));
-      g_pause_until_ms[idx] = GetTickCount64() + 15000;
-      return;
-     }
-
-   if(candles_vs && basket < -2.0)
-     {
-      CloseOurSymbol(sym, StringFormat(
-         "H1 разворот против нас basket=$%.2f | %s", basket, flow.reason));
-      g_pause_until_ms[idx] = GetTickCount64() + 15000;
+         "H1cl против + cut$ basket=$%.2f | %s", basket, flow.reason));
+      g_pause_until_ms[idx] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 30000);
      }
   }
 
@@ -946,9 +941,30 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if((long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic) return;
    long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) return;
-   g_day_pnl += HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
-              + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
-              + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   double deal_pnl = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                   + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                   + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   g_day_pnl += deal_pnl;
+   if(deal_pnl >= 0.0)
+     {
+      g_day_income += deal_pnl;
+      g_loss_streak = 0;
+     }
+   else
+     {
+      g_day_expense += (-deal_pnl);
+      g_loss_streak++;
+      // После минуса — длинная пауза на символе (сумма важнее частоты)
+      string dsym = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+      for(int i = 0; i < g_sym_count; i++)
+         if(g_syms[i] == dsym)
+            g_pause_until_ms[i] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 30000);
+      if(g_loss_streak >= 2)
+         PrintFormat("LOSS STREAK %d | приход$=%.2f расход$=%.2f net$=%.2f — ждём cooldown",
+                     g_loss_streak, g_day_income, g_day_expense, g_day_pnl);
+     }
+   PrintFormat("DEAL $%+.2f | приход$=%.2f расход$=%.2f net$=%.2f",
+               deal_pnl, g_day_income, g_day_expense, g_day_pnl);
   }
 
 //+------------------------------------------------------------------+
@@ -967,9 +983,12 @@ void ResetDayIfNeeded()
    if(start == g_day_start) return;
    g_day_start = start;
    g_day_pnl = 0;
+   g_day_income = 0;
+   g_day_expense = 0;
    g_day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_trading_paused = false;
    g_trades_today = 0;
+   g_loss_streak = 0;
    Print("Новый день — лимиты сброшены");
   }
 
@@ -982,6 +1001,10 @@ bool DayRiskHit()
       double lim = g_day_start_balance * InpMaxLossPercent / 100.0;
       if(g_day_pnl <= -lim) return true;
      }
+   // Расход уже больше прихода — дальше только копаем яму
+   if(InpPauseIfExpenseLeads && g_day_expense > 0.0 &&
+      g_day_expense > g_day_income + 5.0 && g_trades_today >= 3)
+      return true;
    return false;
   }
 
@@ -1002,8 +1025,9 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.90 PROFIT\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nВход только M1+M5+H1 вместе. Цель: плюс, не спам.",
-              list, g_day_pnl, g_trades_today, InpLot,
+              "ProfitScalper v3.91 SUM$\n%s\n————\nnet$ %.2f | приход$ %.2f | расход$ %.2f\ntrades %d | lot %.2f | lock$%.0f>cut$%.1f | pause %s\nВажно сумма $, не число плюсов.",
+              list, g_day_pnl, g_day_income, g_day_expense,
+              g_trades_today, InpLot, InpMinProfitMoney, InpBasketCutLoss,
               g_trading_paused ? "YES" : "no"));
   }
 //+------------------------------------------------------------------+
