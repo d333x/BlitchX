@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
-//|  v3.97: предикт микро (M1–M15) + H1-фильтр; без залипания в BUY   |
+//|  v3.98: LTF cascade — вход через конфликт H1, если M15+M5+M1 жёстко |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -357,22 +357,20 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       f.conf = 0.0;
    else
       f.conf = 100.0 * MathAbs(micro_buy - micro_sell) / micro_tot;
-   // Конфликт H1 vs LTF → режем уверенность (не входим «в лоб»)
-   if(conflict)
-      f.conf *= 0.55;
+   // Конфликт H1 vs LTF: штраф отложим — после cascade (сильный LTF не режем в 49%)
 
    const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.15 && m1_fast >= -thr_m1 * 0.25);
    const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.15 && m1_fast <= thr_m1 * 0.25);
 
-   // Структура: LTF обязательны; H1 желателен, но не обязателен при сильном микро
+   // Структура: LTF обязательны; сильный микро может идти против H1 (cascade)
    const bool struct_buy =
       (m5_now > 0 || f.m5_pts >= thr_m5 * 0.20 || m15_now > 0 || m5_cl > 0) &&
       (m15_pts > -thr_m15 * 0.15 || m15_now > 0 || m15_cl > 0) &&
-      (macro_dir == ORDER_TYPE_BUY || (!conflict && micro_buy > micro_sell + 3.0));
+      (macro_dir == ORDER_TYPE_BUY || micro_buy > micro_sell + 3.0);
    const bool struct_sell =
       (m5_now < 0 || f.m5_pts <= -thr_m5 * 0.20 || m15_now < 0 || m5_cl < 0) &&
       (m15_pts < thr_m15 * 0.15 || m15_now < 0 || m15_cl < 0) &&
-      (macro_dir == ORDER_TYPE_SELL || (!conflict && micro_sell > micro_buy + 3.0));
+      (macro_dir == ORDER_TYPE_SELL || micro_sell > micro_buy + 3.0);
 
    // Блок: свеча H1 против при слабом микро
    const bool wick_blocks_buy  = (h1_now < 0 && h1_cl < 0 && micro_buy < micro_sell + 2.0);
@@ -410,21 +408,45 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       if(below_ema && !m5_up) f.align_score++;
      }
 
-   // Полное выравнивание: 3 LTF + микро без конфликта ИЛИ все 4 ТФ
+   // Полное выравнивание: 3 LTF + микро; H1 не обязателен при сильном cascade
    const bool ltf_buy  = m15_up && m5_up && m1_up;
    const bool ltf_sell = m15_dn && m5_dn && m1_dn;
-   const bool aligned_buy  = ltf_buy && (h1_up || !conflict) && m1_with_buy && !wick_blocks_buy;
-   const bool aligned_sell = ltf_sell && (h1_dn || !conflict) && m1_with_sell && !wick_blocks_sell;
+   const double micro_gap = MathAbs(micro_buy - micro_sell);
+   // Hard cascade: как у юзера — μ SELL 18 / BUY 1, EMA ниже, все LTF↓, H1↑
+   const bool strong_sell_ltf =
+      (ltf_sell && micro_sell >= micro_buy + 4.0 &&
+       (below_ema || micro_gap >= 6.0) && m1_with_sell && !wick_blocks_sell);
+   const bool strong_buy_ltf =
+      (ltf_buy && micro_buy >= micro_sell + 4.0 &&
+       (above_ema || micro_gap >= 6.0) && m1_with_buy && !wick_blocks_buy);
+
+   // Конфликт: мягкий штраф, НО не режем conf в 49%, если LTF cascade жёсткий
+   if(conflict && !(strong_sell_ltf || strong_buy_ltf))
+     {
+      f.conf *= 0.70;
+      f.conf = MathMax(8.0, MathMin(72.0, f.conf));
+     }
+   else if(strong_sell_ltf || strong_buy_ltf)
+     {
+      f.conf = MathMax(f.conf, min_enter_conf);
+      if(conflict)
+         f.conf = MathMax(f.conf, min_enter_conf + 2.0);
+     }
+
+   const bool aligned_buy  = ltf_buy && (h1_up || !conflict || strong_buy_ltf) && m1_with_buy && !wick_blocks_buy;
+   const bool aligned_sell = ltf_sell && (h1_dn || !conflict || strong_sell_ltf) && m1_with_sell && !wick_blocks_sell;
    f.aligned = (aligned_buy || aligned_sell);
 
    const bool money_big = (f.expected_usd >= min_big_usd);
    const bool money_mid = (f.expected_usd >= min_big_usd * 0.55);
    const bool conf_big  = (f.conf >= min_enter_conf);
    const bool conf_mid  = (f.conf >= min_enter_conf * 0.85);
-   const bool weight_gap = MathAbs(micro_buy - micro_sell) >= 3.5;
+   const bool weight_gap = (micro_gap >= 3.5);
 
-   // Конфликт H1↔LTF → максимум MID (не BIG) — меньше ложных входов «постаршему ТФ»
-   if(conflict)
+   // BIG: либо чистое выравнивание, либо hard LTF cascade поверх H1-конфликта
+   if(strong_sell_ltf || strong_buy_ltf)
+      f.opportunity = (money_mid ? OPP_BIG : OPP_MID);
+   else if(conflict)
       f.opportunity = (money_mid && conf_mid && f.align_score >= 3) ? OPP_MID : OPP_SMALL;
    else if(money_big && conf_big && f.align_score >= 4 && weight_gap)
       f.opportunity = OPP_BIG;
@@ -444,8 +466,10 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
    string opp_tag = (f.opportunity == OPP_BIG ? "КРУПНЫЙ"
                      : (f.opportunity == OPP_MID ? "СРЕДНИЙ" : "МЕЛКИЙ"));
    string forecast = (f.dir == ORDER_TYPE_BUY ? "BUY" : "SELL");
-   if(conflict)
+   if(conflict && !(strong_sell_ltf || strong_buy_ltf))
       forecast = StringFormat("%s≠H1", forecast);
+   else if(conflict)
+      forecast = StringFormat("%s·cas", forecast);
 
    f.analysis = StringFormat(
       "H1:%s M15:%s M5:%s M1:%s EMA:%s | μ BUY %.1f/SELL %.1f | %s ~$%.0f align=%d%s",
@@ -455,11 +479,12 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       m1_up ? "↑" : (m1_dn ? "↓" : "="),
       above_ema ? "выше" : (below_ema ? "ниже" : "около"),
       micro_buy, micro_sell, opp_tag, f.expected_usd, f.align_score,
-      conflict ? " КОНФЛИКТ" : "");
+      conflict ? (strong_sell_ltf || strong_buy_ltf ? " CASCADE" : " КОНФЛИКТ") : "");
 
    bool enter_buy = false;
    bool enter_sell = false;
 
+   // Обычный BIG без конфликта
    if(f.opportunity == OPP_BIG && !conflict)
      {
       if(f.dir == ORDER_TYPE_BUY && struct_buy && m1_with_buy && !wick_blocks_buy &&
@@ -473,13 +498,22 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       if(aligned_sell && micro_sell >= micro_buy)
         { enter_sell = true; f.conf = MathMax(f.conf, min_enter_conf); }
      }
-   // Сильный LTF cascade без идеального H1 — всё же BIG, если макро не против жёстко
-   if(f.opportunity == OPP_BIG && conflict && MathAbs(micro_buy - micro_sell) >= 5.0 && f.conf >= min_enter_conf)
+
+   // v3.98 CASCADE: H1 против, но M15+M5+M1 + μ разрыв → ВХОД (как шорт «на глаз»)
+   if(f.opportunity == OPP_BIG && money_mid)
      {
-      // не входим против жёсткого H1 cl+now — только ждём
-      f.opportunity = OPP_MID;
-      enter_buy = false;
-      enter_sell = false;
+      if(strong_sell_ltf && f.dir == ORDER_TYPE_SELL && struct_sell)
+        {
+         enter_sell = true;
+         f.conf = MathMax(f.conf, min_enter_conf);
+         f.reason = "CASCADE_SELL " + f.reason;
+        }
+      if(strong_buy_ltf && f.dir == ORDER_TYPE_BUY && struct_buy)
+        {
+         enter_buy = true;
+         f.conf = MathMax(f.conf, min_enter_conf);
+         f.reason = "CASCADE_BUY " + f.reason;
+        }
      }
 
    if(enter_buy)

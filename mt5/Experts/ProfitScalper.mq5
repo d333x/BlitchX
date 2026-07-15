@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.97 — предикт по микро-потоку (M1–M15), H1 только фильтр       |
-//|  Конфликт H1≠LTF → не BUY «в лоб», ждём или SELL по факту         |
+//|  v3.98 — LTF cascade: M15+M5+M1 жёстко → вход даже при H1 против  |
+//|  Больше не «ЖДЁМ 49% МЕЛКИЙ» при μ SELL 18 / BUY 1                |
 #property copyright "ProfitScalper"
-#property version   "3.97"
-#property description "Прогноз ближайшего хода. BUY и SELL равноправны. Конфликт ТФ = ждать."
+#property version   "3.98"
+#property description "CASCADE: сильный LTF поток входит через конфликт H1. Мелкий шум — ждём."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -304,7 +304,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.97 PRED | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f | micro-first (BUY=SELL)",
+   PrintFormat("ProfitScalper v3.98 CASCADE | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f | LTF-cascade (BUY=SELL)",
                _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney, InpPanicCutMoney);
    g_last_pulse_ms = 0;
    g_last_signal_print_ms = 0;
@@ -466,7 +466,7 @@ void DrawSignalOnChart()
    // Компактная панель СВЕРХУ СПРАВА — не лезет на one-click и не дублирует Comment
    int y = 18;
    HudLabel("PS_HUD0", y, 11, "Segoe UI Semibold", clrWhite,
-            "ProfitScalper  ·  v3.97");
+            "ProfitScalper  ·  v3.98");
    y += 20;
    HudLabel("PS_HUD1", y, 9, "Consolas", C'130,140,155',
             "────────────────────────");
