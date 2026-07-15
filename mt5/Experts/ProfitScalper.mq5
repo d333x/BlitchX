@@ -58,7 +58,7 @@ input int                  InpSlowEMA   = 50;
 input int                  InpATRPeriod = 14;
 input double               InpATR_SL_Mult = 1.8;
 input bool                 InpUseSpreadFilter = true;
-input int                  InpMaxSpreadPts = 300;      // золото
+input int                  InpMaxSpreadPts = 800;      // золото/демо часто шире
 
 input group "=== База знаний ==="
 input bool                 InpStickyLastDir = false;
@@ -389,7 +389,15 @@ void FarmSymbol(const int idx)
 
    MarketScore score;
    if(!AnalyzeSymbol(idx, score))
+     {
+      if(g_last_skip_ms[idx] == 0 ||
+         (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
+        {
+         g_last_skip_ms[idx] = GetTickCount64();
+         PrintFormat("SKIP analyze %s (нет котировок/индикаторов)", sym);
+        }
       return;
+     }
 
    ENUM_ORDER_TYPE type;
    string reason;
@@ -439,9 +447,17 @@ void FarmSymbol(const int idx)
      {
       int max_spread = InpMaxSpreadPts;
       if(IsGoldSymbol(sym))
-         max_spread = MathMax(max_spread, 300);
+         max_spread = MathMax(max_spread, 800);
       if(score.spread_pts > (double)max_spread)
+        {
+         if(g_last_skip_ms[idx] == 0 ||
+            (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
+           {
+            g_last_skip_ms[idx] = GetTickCount64();
+            PrintFormat("SKIP spread %s: %.0f > %d", sym, score.spread_pts, max_spread);
+           }
          return;
+        }
      }
 
    // Меньше «ковыряния»: 3 вместо агрессивной пятёрки при слабом flow
@@ -452,6 +468,9 @@ void FarmSymbol(const int idx)
    int need = MathMin(basket, InpMaxPositions - open_now);
    if(need <= 0)
       return;
+
+   PrintFormat("TRY %s %s need=%d spread=%.0f | %s",
+               sym, type == ORDER_TYPE_BUY ? "BUY" : "SELL", need, score.spread_pts, reason);
 
    int opened = OpenBasket(sym, type, score, reason, need);
    if(opened > 0)
@@ -676,9 +695,12 @@ void ProtectAgainstFlow(const int idx)
 //+------------------------------------------------------------------+
 bool OpenTrade(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &s, const string reason)
   {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return false;
-   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) return false;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+     { Print("OPEN deny: Terminal trade OFF"); return false; }
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+     { Print("OPEN deny: EA AutoTrading OFF (кнопка Алготорговля)"); return false; }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+     { Print("OPEN deny: Account trade OFF"); return false; }
 
    trade.SetTypeFillingBySymbol(sym);
 
