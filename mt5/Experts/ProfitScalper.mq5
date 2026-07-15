@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.85 — постоянный пульс + вход по H1, без часовой тишины         |
+  //|  v3.86 — Analyze больше не стопорит вход при мёртвых индикаторах   |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.85"
-#property description "Автофарм золота: H1 задаёт сторону, пульс каждые 10с в журнал."
+#property version   "3.86"
+#property description "Автофарм: не блокируется пустыми EMA. Пульс 10с. H1 ведёт."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -269,7 +269,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.85 LIVE | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f | dayCap=$%.0f",
+   PrintFormat("ProfitScalper v3.86 LIVE | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f | dayCap=$%.0f",
                _Symbol, InpLot, InpMinProfitMoney,
                InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss, InpMaxLossMoney);
    g_last_pulse_ms = 0;
@@ -491,23 +491,55 @@ bool AnalyzeSymbol(const int idx, MarketScore &s)
    s.atr_pts = 0; s.spread_pts = 0; s.trend_up = false; s.trend_down = false;
    string sym = g_syms[idx];
 
-   double fast[], slow[], atr[];
-   ArraySetAsSeries(fast, true);
-   ArraySetAsSeries(slow, true);
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(g_ema_fast[idx], 0, 0, 3, fast) < 3) return false;
-   if(CopyBuffer(g_ema_slow[idx], 0, 0, 3, slow) < 3) return false;
-   if(CopyBuffer(g_atr[idx], 0, 0, 3, atr) < 3) return false;
-
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    if(point <= 0.0) return false;
    double bid = SymbolInfoDouble(sym, SYMBOL_BID);
    double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(bid <= 0.0 || ask <= 0.0) return false;
    s.spread_pts = (ask - bid) / point;
-   s.atr_pts = atr[1] / point;
-   // Мягкий тренд: положение EMA, без требования «растущей» fast
-   s.trend_up = (fast[1] > slow[1]);
-   s.trend_down = (fast[1] < slow[1]);
+
+   // ATR: сначала кэш-хендл, при сбое — разовый iATR (после рестартов Wine часто пусто)
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   bool got_atr = false;
+   if(g_atr[idx] != INVALID_HANDLE && CopyBuffer(g_atr[idx], 0, 0, 3, atr) >= 3)
+     {
+      s.atr_pts = atr[1] / point;
+      got_atr = true;
+     }
+   if(!got_atr)
+     {
+      int h = iATR(sym, PERIOD_M15, InpATRPeriod);
+      if(h != INVALID_HANDLE)
+        {
+         if(CopyBuffer(h, 0, 0, 3, atr) >= 3)
+           {
+            s.atr_pts = atr[1] / point;
+            got_atr = true;
+           }
+         IndicatorRelease(h);
+        }
+     }
+   if(!got_atr || s.atr_pts <= 0.0)
+      s.atr_pts = MathMax(s.spread_pts * 8.0, 80.0); // запасной ATR чтобы ордера шли
+
+   double fast[], slow[];
+   ArraySetAsSeries(fast, true);
+   ArraySetAsSeries(slow, true);
+   if(g_ema_fast[idx] != INVALID_HANDLE && g_ema_slow[idx] != INVALID_HANDLE &&
+      CopyBuffer(g_ema_fast[idx], 0, 0, 3, fast) >= 3 &&
+      CopyBuffer(g_ema_slow[idx], 0, 0, 3, slow) >= 3)
+     {
+      s.trend_up = (fast[1] > slow[1]);
+      s.trend_down = (fast[1] < slow[1]);
+     }
+   else
+     {
+      // Тренд для panel — по живому flow, без блокировки входа
+      MarketFlow fl = ReadMarketFlow(sym);
+      s.trend_up = (fl.dir == ORDER_TYPE_BUY);
+      s.trend_down = (fl.dir == ORDER_TYPE_SELL);
+     }
    return true;
   }
 
@@ -973,7 +1005,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.85 LIVE — автофарм\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nH1 задаёт сторону. Пульс каждые 10с в Experts.",
+              "ProfitScalper v3.86 LIVE — автофарм\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nH1 сторона. Пульс 10с. Индикаторы не стопят вход.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
