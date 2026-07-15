@@ -322,9 +322,7 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_ema_slow[i]);
       IndicatorRelease(g_atr[i]);
      }
-   ObjectDelete(0, "PS_SIG");
-   ObjectDelete(0, "PS_AN");
-   Comment("");
+   ClearHud();
    Print("ProfitScalper остановлен");
   }
 
@@ -410,41 +408,92 @@ void RefreshAllSignals()
   }
 
 //+------------------------------------------------------------------+
+void HudLabel(const string name, const int y, const int fontsize,
+              const string font, const color clr, const string text)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 12);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+     }
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontsize);
+   ObjectSetString(0, name, OBJPROP_FONT, font);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+  }
+
+//+------------------------------------------------------------------+
+void ClearHud()
+  {
+   Comment(""); // больше не дублируем текст поверх лейблов
+   string names[] = {"PS_SIG","PS_AN","PS_HUD0","PS_HUD1","PS_HUD2","PS_HUD3",
+                     "PS_HUD4","PS_HUD5","PS_HUD6","PS_HUD7","PS_HUD8"};
+   for(int i = 0; i < ArraySize(names); i++)
+      ObjectDelete(0, names[i]);
+  }
+
+//+------------------------------------------------------------------+
 void DrawSignalOnChart()
   {
    if(g_sym_count <= 0) return;
    const int i = 0;
-   color clr = clrSilver;
-   if(g_signal_enter[i] && g_pred_side[i] == "UP/BUY") clr = clrLime;
-   else if(g_signal_enter[i] && g_pred_side[i] == "DOWN/SELL") clr = clrTomato;
-   else if(StringFind(g_pred_side[i], "BUY") >= 0) clr = clrDodgerBlue;
-   else if(StringFind(g_pred_side[i], "SELL") >= 0) clr = clrOrangeRed;
 
-   if(ObjectFind(0, "PS_SIG") < 0)
+   color clr_sig = clrSilver;
+   string status = "ЖДЁМ";
+   if(g_signal_enter[i])
      {
-      ObjectCreate(0, "PS_SIG", OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, "PS_SIG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, "PS_SIG", OBJPROP_XDISTANCE, 10);
-      ObjectSetInteger(0, "PS_SIG", OBJPROP_YDISTANCE, 18);
-      ObjectSetInteger(0, "PS_SIG", OBJPROP_FONTSIZE, 14);
-      ObjectSetString(0, "PS_SIG", OBJPROP_FONT, "Arial Bold");
-      ObjectSetInteger(0, "PS_SIG", OBJPROP_SELECTABLE, false);
+      status = "ВХОД";
+      if(g_pred_side[i] == "UP/BUY") clr_sig = clrLime;
+      else clr_sig = clrTomato;
      }
-   ObjectSetString(0, "PS_SIG", OBJPROP_TEXT, g_signal_txt[i]);
-   ObjectSetInteger(0, "PS_SIG", OBJPROP_COLOR, clr);
+   else if(StringFind(g_pred_side[i], "BUY") >= 0) clr_sig = C'100,180,255';
+   else if(StringFind(g_pred_side[i], "SELL") >= 0) clr_sig = C'255,140,90';
 
-   if(ObjectFind(0, "PS_AN") < 0)
-     {
-      ObjectCreate(0, "PS_AN", OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, "PS_AN", OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, "PS_AN", OBJPROP_XDISTANCE, 10);
-      ObjectSetInteger(0, "PS_AN", OBJPROP_YDISTANCE, 40);
-      ObjectSetInteger(0, "PS_AN", OBJPROP_FONTSIZE, 9);
-      ObjectSetString(0, "PS_AN", OBJPROP_FONT, "Consolas");
-      ObjectSetInteger(0, "PS_AN", OBJPROP_COLOR, clrSilver);
-      ObjectSetInteger(0, "PS_AN", OBJPROP_SELECTABLE, false);
-     }
-   ObjectSetString(0, "PS_AN", OBJPROP_TEXT, g_analysis[i]);
+   string opp = "МЕЛКИЙ";
+   if(g_opp_size[i] == OPP_BIG) opp = "КРУПНЫЙ";
+   else if(g_opp_size[i] == OPP_MID) opp = "СРЕДНИЙ";
+
+   string side = (StringFind(g_pred_side[i], "SELL") >= 0) ? "SELL" : "BUY";
+   int open_n = CountOurPositions(g_syms[i]);
+
+   // Компактная панель СВЕРХУ СПРАВА — не лезет на one-click и не дублирует Comment
+   int y = 18;
+   HudLabel("PS_HUD0", y, 11, "Segoe UI Semibold", clrWhite,
+            "ProfitScalper  ·  v3.95");
+   y += 20;
+   HudLabel("PS_HUD1", y, 9, "Consolas", C'130,140,155',
+            "────────────────────────");
+   y += 18;
+   HudLabel("PS_HUD2", y, 14, "Segoe UI Semibold", clr_sig,
+            StringFormat("%s   %s  %.0f%%", status, side, g_conf[i]));
+   y += 22;
+   HudLabel("PS_HUD3", y, 10, "Consolas", clrSilver,
+            StringFormat("%s   ~$%.0f   align %d/5", opp, g_expected_usd[i], g_align_score[i]));
+   y += 18;
+   HudLabel("PS_HUD4", y, 9, "Consolas", C'160,170,180',
+            g_analysis[i]);
+   y += 18;
+   HudLabel("PS_HUD5", y, 9, "Consolas", C'130,140,155',
+            "────────────────────────");
+   y += 18;
+   color net_clr = (g_day_pnl >= 0.0 ? C'80,220,140' : C'255,110,110');
+   HudLabel("PS_HUD6", y, 11, "Segoe UI Semibold", net_clr,
+            StringFormat("net  $%.2f", g_day_pnl));
+   y += 18;
+   HudLabel("PS_HUD7", y, 9, "Consolas", clrSilver,
+            StringFormat("приход $%.2f   расход $%.2f", g_day_income, g_day_expense));
+   y += 16;
+   HudLabel("PS_HUD8", y, 9, "Consolas", C'160,170,180',
+            StringFormat("поз %d   lot %.2f   lock $%.0f   %s",
+                         open_n, InpLot, g_lock_target[i],
+                         g_signal_enter[i] ? "по сигналу" : "ждём КРУПНЫЙ"));
+
    ChartRedraw(0);
   }
 
@@ -1221,28 +1270,8 @@ bool DayRiskHit()
 //+------------------------------------------------------------------+
 void UpdatePanel()
   {
-   string list = "";
-   for(int i = 0; i < g_sym_count; i++)
-     {
-      if(i > 0) list += "\n----\n";
-      string action = g_signal_enter[i] ? "→ РАБОТАЕМ ПО СИГНАЛУ" : "→ ждём подтверждение";
-      list += StringFormat(
-                 "%s\n%s\n%s\nАНАЛИЗ: BUY %.1f vs SELL %.1f (%.0f%%) %s%s\npos=%d | lock $%.2f\n%s",
-                 g_syms[i],
-                 g_signal_txt[i],
-                 g_analysis[i],
-                 g_score_buy[i], g_score_sell[i], g_conf[i],
-                 g_pred_side[i],
-                 g_pred_strong[i] ? " [BIG]" : "",
-                 CountOurPositions(g_syms[i]),
-                 g_lock_target[i],
-                 action);
-     }
-   Comment(StringFormat(
-              "ProfitScalper v3.95 BIG\n%s\n————\nnet$ %.2f | приход$ %.2f | расход$ %.2f\ntrades %d | lot %.2f | pause %s\nТолько КРУПНЫЙ. lock$%.0f panic$%.0f (1 cut < 1 lock).",
-              list, g_day_pnl, g_day_income, g_day_expense,
-              g_trades_today, InpLot,
-              g_trading_paused ? "YES" : "no",
-              InpMinProfitMoney, InpPanicCutMoney));
+   // Весь HUD рисуется лейблами справа — Comment отключён (больше нет наложения)
+   Comment("");
+   DrawSignalOnChart();
   }
 //+------------------------------------------------------------------+
