@@ -167,31 +167,31 @@ MarketFlow ReadMarketFlow(const string sym)
 
    f.reason += StringFormat("|M1=%.0f M5=%.0f M15=%.0f H1=%.0f", f.m1_pts, f.m5_pts, m15_pts, h1_pts);
 
-   // M1 обязательно с нами — иначе мгновенный минус на золоте
-   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.35 && m1_fast >= -thr_m1 * 0.25);
-   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.35 && m1_fast <= thr_m1 * 0.25);
+   // M1 с направлением структуры. Без потолка «климакса» — он блокировал профитный тренд.
+   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.20 && m1_fast >= -thr_m1 * 0.45);
+   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.20 && m1_fast <= thr_m1 * 0.45);
 
-   // Структура: закрытый H1 или сильный наклон H1 + текущие M5/H1
+   // Структура: H1 + M15/M5. M5now doji (0) не блокирует, если наклон M5 наш
    const bool struct_buy =
-      (h1_cl > 0 || h1_pts >= thr_h1 * 0.35 || h1_now > 0) &&
-      (m5_now > 0) &&
+      (h1_cl > 0 || h1_pts >= thr_h1 * 0.30 || h1_now > 0) &&
+      (m5_now > 0 || f.m5_pts >= thr_m5 * 0.25 || m15_now > 0) &&
       (above_ema || m15_now > 0 || f.m5_pts > 0);
    const bool struct_sell =
-      (h1_cl < 0 || h1_pts <= -thr_h1 * 0.35 || h1_now < 0) &&
-      (m5_now < 0) &&
+      (h1_cl < 0 || h1_pts <= -thr_h1 * 0.30 || h1_now < 0) &&
+      (m5_now < 0 || f.m5_pts <= -thr_m5 * 0.25 || m15_now < 0) &&
       (below_ema || m15_now < 0 || f.m5_pts < 0);
 
    // Не покупать в красный H1-сейчас; не продавать в зелёный H1-сейчас
    const bool wick_blocks_buy  = (h1_now < 0 && h1_cl <= 0);
    const bool wick_blocks_sell = (h1_now > 0 && h1_cl >= 0);
 
-   if(struct_buy && m1_with_buy && !wick_blocks_buy && f.buy_v >= f.sell_v + 2 && f.buy_v >= 4)
+   if(struct_buy && m1_with_buy && !wick_blocks_buy && f.buy_v >= f.sell_v + 1 && f.buy_v >= 4)
      {
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
       f.reason = "QUALITY " + f.reason;
      }
-   else if(struct_sell && m1_with_sell && !wick_blocks_sell && f.sell_v >= f.buy_v + 2 && f.sell_v >= 4)
+   else if(struct_sell && m1_with_sell && !wick_blocks_sell && f.sell_v >= f.buy_v + 1 && f.sell_v >= 4)
      {
       f.dir = ORDER_TYPE_SELL;
       f.clear = true;
