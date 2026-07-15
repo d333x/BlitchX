@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
-//|  v3.81: ясный ход мягче — сильный M1 торгуем, M1f только veto     |
+//|  v3.83: направление по СВЕЧАМ (M5/M15/H1), а не по микро-пипу M1 |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -44,7 +44,6 @@ double CloseSlope(const string sym, const ENUM_TIMEFRAMES tf, const int look)
    double c[];
    ArraySetAsSeries(c, true);
    int n = MathMax(look + 1, 2);
-   // shift 0 = текущая (формирующаяся) свеча — живой рынок
    if(CopyClose(sym, tf, 0, n, c) < n) return 0.0;
    return (c[0] - c[look]);
   }
@@ -72,7 +71,6 @@ double ATRPts(const string sym, const ENUM_TIMEFRAMES tf, const int period = 14)
   }
 
 //+------------------------------------------------------------------+
-// Голос: +1 buy / +1 sell. thr_pts — порог в пунктах.
 void VoteSlope(const double slope_pts, const double thr,
                int &buy_v, int &sell_v, string &why, const string tag)
   {
@@ -83,7 +81,22 @@ void VoteSlope(const double slope_pts, const double thr,
   }
 
 //+------------------------------------------------------------------+
-// Главное: куда идёт рынок прямо сейчас.
+// Формирующаяся свеча: +1 / −1 / 0
+int FormingCandleDir(const string sym, const ENUM_TIMEFRAMES tf, string &why, const string tag)
+  {
+   double o[], c[];
+   ArraySetAsSeries(o, true);
+   ArraySetAsSeries(c, true);
+   if(CopyOpen(sym, tf, 0, 1, o) < 1 || CopyClose(sym, tf, 0, 1, c) < 1)
+      return 0;
+   if(c[0] > o[0]) { why += tag + "↑ "; return 1; }
+   if(c[0] < o[0]) { why += tag + "↓ "; return -1; }
+   why += tag + "= ";
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+// Главное: куда идут СВЕЧИ (то что видно глазом), M1 — только подтверждение.
 MarketFlow ReadMarketFlow(const string sym)
   {
    MarketFlow f;
@@ -95,26 +108,32 @@ MarketFlow ReadMarketFlow(const string sym)
 
    double atr_m1 = ATRPts(sym, PERIOD_M1, 14);
    double atr_m5 = ATRPts(sym, PERIOD_M5, 14);
-   // Чуть мягче пороги — золото часто «шумное», но ход есть
-   double thr_m1 = MathMax(atr_m1 * 0.22, 18.0);
-   double thr_m5 = MathMax(atr_m5 * 0.18, 30.0);
-   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.15, 40.0);
+   double thr_m1 = MathMax(atr_m1 * 0.28, 22.0);
+   double thr_m5 = MathMax(atr_m5 * 0.20, 35.0);
+   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.18, 45.0);
+   double thr_h1 = MathMax(ATRPts(sym, PERIOD_H1, 14) * 0.12, 60.0);
 
    f.m1_pts = Pts(sym, CloseSlope(sym, PERIOD_M1, 8));
    f.m5_pts = Pts(sym, CloseSlope(sym, PERIOD_M5, 4));
    double m15_pts = Pts(sym, CloseSlope(sym, PERIOD_M15, 4));
-   double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3)); // короткий импульс
+   double h1_pts = Pts(sym, CloseSlope(sym, PERIOD_H1, 3));
+   double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3));
 
-   VoteSlope(f.m1_pts, thr_m1, f.buy_v, f.sell_v, f.reason, "M1");
-   // M1f не голосует (короткий шум ломал вход) — только soft-veto ниже
-   if(m1_fast >= thr_m1 * 0.55) f.reason += "M1f↑ ";
-   else if(m1_fast <= -thr_m1 * 0.55) f.reason += "M1f↓ ";
+   // Структура: M5 / M15 / H1 (вес как у глаза на графике)
    VoteSlope(f.m5_pts, thr_m5, f.buy_v, f.sell_v, f.reason, "M5");
    VoteSlope(m15_pts, thr_m15, f.buy_v, f.sell_v, f.reason, "M15");
+   VoteSlope(h1_pts, thr_h1, f.buy_v, f.sell_v, f.reason, "H1");
 
-   bool above_ema = false;
-   bool below_ema = false;
-   // Цена vs EMA20 на M5 (живой) — мёртвая зона около EMA
+   // Текущие свечи — то, что пользователь видит
+   const int m5_now = FormingCandleDir(sym, PERIOD_M5, f.reason, "M5now");
+   const int m15_now = FormingCandleDir(sym, PERIOD_M15, f.reason, "M15now");
+   const int h1_now = FormingCandleDir(sym, PERIOD_H1, f.reason, "H1now");
+   if(m5_now > 0) f.buy_v++; else if(m5_now < 0) f.sell_v++;
+   if(m15_now > 0) f.buy_v++; else if(m15_now < 0) f.sell_v++;
+   if(h1_now > 0) f.buy_v += 2; else if(h1_now < 0) f.sell_v += 2; // H1 важнее
+
+   // EMA20 M5
+   bool above_ema = false, below_ema = false;
    int ema = iMA(sym, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
    if(ema != INVALID_HANDLE)
      {
@@ -123,7 +142,7 @@ MarketFlow ReadMarketFlow(const string sym)
       if(CopyBuffer(ema, 0, 0, 2, e) >= 2)
         {
          double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-         double dead = SymbolInfoDouble(sym, SYMBOL_POINT) * MathMax(thr_m1 * 0.15, 8.0);
+         double dead = SymbolInfoDouble(sym, SYMBOL_POINT) * MathMax(thr_m1 * 0.2, 10.0);
          if(bid > e[0] + dead) { f.buy_v++; above_ema = true; f.reason += "aboveEMA5 "; }
          else if(bid < e[0] - dead) { f.sell_v++; below_ema = true; f.reason += "belowEMA5 "; }
          else f.reason += "nearEMA5 ";
@@ -131,69 +150,61 @@ MarketFlow ReadMarketFlow(const string sym)
       IndicatorRelease(ema);
      }
 
-   // Формирующаяся M5 свеча
-   bool m5_up = false, m5_dn = false;
-   double o[], c[];
-   ArraySetAsSeries(o, true);
-   ArraySetAsSeries(c, true);
-   if(CopyOpen(sym, PERIOD_M5, 0, 1, o) >= 1 && CopyClose(sym, PERIOD_M5, 0, 1, c) >= 1)
-     {
-      if(c[0] > o[0]) { f.buy_v++; m5_up = true; f.reason += "M5now↑ "; }
-      else if(c[0] < o[0]) { f.sell_v++; m5_dn = true; f.reason += "M5now↓ "; }
-     }
+   // M1 только подпись / мягкое подтверждение (не перебивает свечи)
+   if(f.m1_pts >= thr_m1) f.reason += "M1↑ ";
+   else if(f.m1_pts <= -thr_m1) f.reason += "M1↓ ";
+   if(m1_fast >= thr_m1 * 0.55) f.reason += "M1f↑ ";
+   else if(m1_fast <= -thr_m1 * 0.55) f.reason += "M1f↓ ";
 
-   f.reason += StringFormat("|M1=%.0f M5=%.0f thr1=%.0f", f.m1_pts, f.m5_pts, thr_m1);
+   f.reason += StringFormat("|M1=%.0f M5=%.0f M15=%.0f H1=%.0f", f.m1_pts, f.m5_pts, m15_pts, h1_pts);
 
-   // Soft-veto: короткий импульс блокирует только если сам сильный
-   // И сопоставим с M1 (мелкий отскок на фоне большого хода — игнор)
-   const double veto = thr_m1 * 1.0;
-   const bool m1f_vs_buy  = (m1_fast <= -veto && MathAbs(m1_fast) >= MathAbs(f.m1_pts) * 0.55);
-   const bool m1f_vs_sell = (m1_fast >=  veto && MathAbs(m1_fast) >= MathAbs(f.m1_pts) * 0.55);
-   const bool m1_up = (f.m1_pts >= thr_m1 * 0.25);
-   const bool m1_dn = (f.m1_pts <= -thr_m1 * 0.25);
-   const bool strong_m1_up = (f.m1_pts >= thr_m1 * 0.9);
-   const bool strong_m1_dn = (f.m1_pts <= -thr_m1 * 0.9);
+   // Жёсткие запреты: не покупать в красные свечи / не продавать в зелёные
+   const bool candle_blocks_buy =
+      (h1_now < 0) || (m5_now < 0 && m15_now < 0) ||
+      (m15_pts <= -thr_m15 && f.m5_pts <= 0) ||
+      (h1_pts <= -thr_h1 * 0.5);
+   const bool candle_blocks_sell =
+      (h1_now > 0) || (m5_now > 0 && m15_now > 0) ||
+      (m15_pts >= thr_m15 && f.m5_pts >= 0) ||
+      (h1_pts >= thr_h1 * 0.5);
 
-   // Путь A: перевес голосов + M1 в ту же сторону
-   if(f.buy_v >= f.sell_v + 1 && m1_up && !m1f_vs_buy && f.buy_v >= 2)
+   // BUY: перевес + M1 не против + свечи не красные
+   const bool m1_ok_buy  = (f.m1_pts >= -thr_m1 * 0.35);
+   const bool m1_ok_sell = (f.m1_pts <=  thr_m1 * 0.35);
+
+   if(f.buy_v >= f.sell_v + 2 && f.buy_v >= 3 && m1_ok_buy && !candle_blocks_buy)
      {
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
       f.reason = "FLOW " + f.reason;
      }
-   else if(f.sell_v >= f.buy_v + 1 && m1_dn && !m1f_vs_sell && f.sell_v >= 2)
+   else if(f.sell_v >= f.buy_v + 2 && f.sell_v >= 3 && m1_ok_sell && !candle_blocks_sell)
      {
       f.dir = ORDER_TYPE_SELL;
       f.clear = true;
       f.reason = "FLOW " + f.reason;
-     }
-   // Путь B: сильный M1 + EMA/M5now согласны (M15 может спорить — ок)
-   else if(strong_m1_up && !m1f_vs_buy && (above_ema || m5_up) && f.buy_v >= f.sell_v)
-     {
-      f.dir = ORDER_TYPE_BUY;
-      f.clear = true;
-      f.reason = "M1STRONG " + f.reason;
-     }
-   else if(strong_m1_dn && !m1f_vs_sell && (below_ema || m5_dn) && f.sell_v >= f.buy_v)
-     {
-      f.dir = ORDER_TYPE_SELL;
-      f.clear = true;
-      f.reason = "M1STRONG " + f.reason;
      }
    else
      {
       f.clear = false;
       if(f.buy_v > f.sell_v) f.dir = ORDER_TYPE_BUY;
       else if(f.sell_v > f.buy_v) f.dir = ORDER_TYPE_SELL;
-      else f.dir = (f.m1_pts >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      else f.dir = (f.m5_pts >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+
+      if(candle_blocks_buy && f.dir == ORDER_TYPE_BUY)
+         f.dir = ORDER_TYPE_SELL;
+      if(candle_blocks_sell && f.dir == ORDER_TYPE_SELL)
+         f.dir = ORDER_TYPE_BUY;
+
       f.reason = "CHOP " + f.reason;
+      if(candle_blocks_buy) f.reason = "NOBUY " + f.reason;
+      if(candle_blocks_sell) f.reason = "NOSELL " + f.reason;
      }
 
    return f;
   }
 
 //+------------------------------------------------------------------+
-// Оценка силы для lock / panel (совместимость)
 KnowledgeScore EvaluateKnowledge(const string sym,
                                  const ENUM_TIMEFRAMES /*signal_tf*/,
                                  const bool /*trend_up*/,
@@ -223,7 +234,6 @@ void KnowledgeForceDirWithTieBreak(const string sym,
                             f.buy_v, f.sell_v, f.reason);
    else
       reason = StringFormat("NOCLEAR B%d/S%d %s", f.buy_v, f.sell_v, f.reason);
-   // scores already in ks for panel
    if(ks.buy >= 0) { /* keep */ }
   }
 

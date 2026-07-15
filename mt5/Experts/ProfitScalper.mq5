@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.82 — вход по M1/M5: короткий шум M1f больше не стопит сделку   |
+  //|  v3.83 — направление по свечам M5/M15/H1, не по микро-пипу M1    |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.82"
-#property description "Живой ход M1/M5. Сильный импульс → вход. Мелкий отскок не блокирует."
+#property version   "3.83"
+#property description "Не покупает в красные свечи. H1/M5/M15 решают направление."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -65,7 +65,7 @@ input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
 input bool                 InpRequireClearFlow = true; // Только когда M1+голоса согласны
 input bool                 InpCloseAgainstFlow = true;  // Закрыть корзину если рынок развернулся
-input double               InpBasketCutLoss = 8.0;      // Резать всю корзину если суммарный минус >= $
+input double               InpBasketCutLoss = 25.0;     // Резать корзину по реальному $ (золото 0.3 лота)
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
@@ -268,7 +268,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.82 FLOW | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
+   PrintFormat("ProfitScalper v3.83 CANDLES | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
                _Symbol, InpLot, InpMinProfitMoney,
                InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss);
    return INIT_SUCCEEDED;
@@ -594,21 +594,34 @@ void ProtectAgainstFlow(const int idx)
       return;
 
    MarketFlow flow = ReadMarketFlow(sym);
-   if(!flow.clear)
-      return; // в чопе не режем агрессивно — ждём cut по $
 
    bool against = ((our == POSITION_TYPE_BUY && flow.dir == ORDER_TYPE_SELL) ||
                    (our == POSITION_TYPE_SELL && flow.dir == ORDER_TYPE_BUY));
-   if(!against)
+
+   // Красные H1/M5 при BUY (и наоборот) — закрываем, даже если clear ещё нет
+   bool candles_vs =
+      (our == POSITION_TYPE_BUY  && (StringFind(flow.reason, "H1now↓") >= 0 ||
+                                     (StringFind(flow.reason, "M5now↓") >= 0 &&
+                                      StringFind(flow.reason, "M15now↓") >= 0))) ||
+      (our == POSITION_TYPE_SELL && (StringFind(flow.reason, "H1now↑") >= 0 ||
+                                     (StringFind(flow.reason, "M5now↑") >= 0 &&
+                                      StringFind(flow.reason, "M15now↑") >= 0)));
+
+   if(!InpCloseAgainstFlow)
       return;
 
-   // Режем только если уже в минусе или сильный импульс против
-   if(basket < -1.0 || MathAbs(flow.m1_pts) >= 120.0)
+   if(!against && !candles_vs)
+      return;
+
+   if(!flow.clear && !candles_vs)
+      return;
+
+   if(candles_vs || basket < -1.0 || MathAbs(flow.m1_pts) >= 80.0)
      {
       CloseOurSymbol(sym, StringFormat(
-         "против потока FLOW %s B%d/S%d M1=%.0f basket=$%.2f",
+         "против свечей/потока %s B%d/S%d M1=%.0f basket=$%.2f | %s",
          flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
-         flow.buy_v, flow.sell_v, flow.m1_pts, basket));
+         flow.buy_v, flow.sell_v, flow.m1_pts, basket, flow.reason));
       g_pause_until_ms[idx] = GetTickCount64() + 15000;
      }
   }
@@ -728,24 +741,7 @@ double PositionMoneyNow(const ulong ticket)
    double money = PositionGetDouble(POSITION_PROFIT)
                   + PositionGetDouble(POSITION_SWAP);
 
-   // Дополнительно считаем по тику — иногда PROFIT обновляется медленнее UI
-   string sym = PositionGetString(POSITION_SYMBOL);
-   long type = PositionGetInteger(POSITION_TYPE);
-   double open = PositionGetDouble(POSITION_PRICE_OPEN);
-   double vol  = PositionGetDouble(POSITION_VOLUME);
-   double tick_val = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double tick_sz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-   if(tick_sz > 0.0 && tick_val > 0.0)
-     {
-      double price = (type == POSITION_TYPE_BUY) ? bid : ask;
-      double pts = (type == POSITION_TYPE_BUY) ? (price - open) : (open - price);
-      double calc = (pts / tick_sz) * tick_val * vol;
-      // берём более «свежую» оценку вверх для lock (быстрее реакция на плюс)
-      if(calc > money)
-         money = calc;
-     }
+   // Только брокерский P/L. Тиковый calc на золоте занижал минус → cut резал «−$8» при реальных −$80.
    return money;
   }
 
@@ -908,7 +904,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.82 — куда идёт рынок СЕЙЧАС\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nСильный M1 → вход. Мелкий отскок не стопит.",
+              "ProfitScalper v3.83 — свечи M5/M15/H1 решают\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nКрасные свечи → не BUY. Зелёные → не SELL.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
