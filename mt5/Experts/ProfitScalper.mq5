@@ -1,11 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.95 — только КРУПНЫЙ ход; R:R так, чтобы 1 лосс ≠ 6 локов     |
-//|  Expectancy (Tharp) + MTF confluence (Elder) + фильтр SMALL/BIG  |
-//+------------------------------------------------------------------+
+//|  v3.97 — предикт по микро-потоку (M1–M15), H1 только фильтр       |
+//|  Конфликт H1≠LTF → не BUY «в лоб», ждём или SELL по факту         |
 #property copyright "ProfitScalper"
-#property version   "3.96"
-#property description "ВХОД = реальный ордер. Пауза/блок видно на панели. Без тихих отказов."
+#property version   "3.97"
+#property description "Прогноз ближайшего хода. BUY и SELL равноправны. Конфликт ТФ = ждать."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -305,11 +304,8 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.96 EXEC | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f cut=$%.2f | onlyBIG=%s conf>=%.0f | stopsAtOpen=%s",
-               _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney,
-               InpPanicCutMoney, InpBasketCutLoss,
-               InpOnlyBigOpportunity ? "YES" : "no", InpMinEnterConf,
-               InpSendStopsAtOpen ? "yes" : "no");
+   PrintFormat("ProfitScalper v3.97 PRED | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f | micro-first (BUY=SELL)",
+               _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney, InpPanicCutMoney);
    g_last_pulse_ms = 0;
    g_last_signal_print_ms = 0;
    RefreshAllSignals();
@@ -470,7 +466,7 @@ void DrawSignalOnChart()
    // Компактная панель СВЕРХУ СПРАВА — не лезет на one-click и не дублирует Comment
    int y = 18;
    HudLabel("PS_HUD0", y, 11, "Segoe UI Semibold", clrWhite,
-            "ProfitScalper  ·  v3.96");
+            "ProfitScalper  ·  v3.97");
    y += 20;
    HudLabel("PS_HUD1", y, 9, "Consolas", C'130,140,155',
             "────────────────────────");
@@ -976,6 +972,41 @@ void ProtectAgainstFlow(const int idx)
    if(in_grace)
       return; // дать золоту дыхание — иначе мгновенный −$ съедает lock
 
+   // Узнать сторону позиции
+   int our = -1;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      our = (int)PositionGetInteger(POSITION_TYPE);
+      break;
+     }
+
+   // Микро (M1/M5) развернулся против — режем раньше половинным cut (меньший убыток)
+   if(our >= 0 && age >= 12)
+     {
+      MarketFlow flow_m = FlowFor(sym);
+      bool buy_wrong =
+         (our == POSITION_TYPE_BUY && flow_m.dir == ORDER_TYPE_SELL &&
+          StringFind(flow_m.analysis, "M5:↓") >= 0 && StringFind(flow_m.analysis, "M1:↓") >= 0 &&
+          flow_m.align_score >= 3);
+      bool sell_wrong =
+         (our == POSITION_TYPE_SELL && flow_m.dir == ORDER_TYPE_BUY &&
+          StringFind(flow_m.analysis, "M5:↑") >= 0 && StringFind(flow_m.analysis, "M1:↑") >= 0 &&
+          flow_m.align_score >= 3);
+      double early_cut = MathAbs(InpBasketCutLoss) * 0.55;
+      if((buy_wrong || sell_wrong) && basket <= -early_cut)
+        {
+         CloseOurSymbol(sym, StringFormat(
+            "MICRO против $%.2f <= -%.2f age=%ds | %s", basket, early_cut, age, flow_m.analysis));
+         g_pause_until_ms[idx] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 30000);
+         g_peak_money[idx] = 0.0;
+         return;
+        }
+     }
+
    if(basket <= -MathAbs(InpBasketCutLoss))
      {
       CloseOurSymbol(sym, StringFormat("basket loss $%.2f <= -%.2f age=%ds", basket, InpBasketCutLoss, age));
@@ -987,16 +1018,6 @@ void ProtectAgainstFlow(const int idx)
    if(!InpCloseAgainstFlow)
       return;
 
-   int our = -1;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
-      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
-      our = (int)PositionGetInteger(POSITION_TYPE);
-      break;
-     }
    if(our < 0)
       return;
 

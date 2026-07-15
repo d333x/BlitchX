@@ -1,7 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
-//|  v3.95: фильтр BIG MOVE — вход только когда реально есть $ ход   |
-//|  База: Triple Screen (Elder), MTF confluence, expectancy (Tharp)  |
+//|  v3.97: предикт микро (M1–M15) + H1-фильтр; без залипания в BUY   |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -180,7 +179,38 @@ int SlopeDir(const double slope_pts, const double thr)
   }
 
 //+------------------------------------------------------------------+
-// Мгновенный предикт: bias всегда; clear = только BIG (или MID если разрешён снаружи).
+// Сколько из последних N закрытых свечей в сторону dir (+1 buy / -1 sell)
+int ClosedRun(const string sym, const ENUM_TIMEFRAMES tf, const int bars, const int want_dir)
+  {
+   double o[], c[];
+   ArraySetAsSeries(o, true);
+   ArraySetAsSeries(c, true);
+   int n = MathMax(bars, 1);
+   if(CopyOpen(sym, tf, 1, n, o) < n) return 0;
+   if(CopyClose(sym, tf, 1, n, c) < n) return 0;
+   int hit = 0;
+   for(int i = 0; i < n; i++)
+     {
+      int d = 0;
+      if(c[i] > o[i]) d = 1;
+      else if(c[i] < o[i]) d = -1;
+      if(d == want_dir) hit++;
+     }
+   return hit;
+  }
+
+//+------------------------------------------------------------------+
+// Ускорение: короткий наклон vs длинный (импульс «куда дальше»)
+double ImpulseAccel(const string sym, const ENUM_TIMEFRAMES tf,
+                    const int short_look, const int long_look)
+  {
+   double short_s = Pts(sym, CloseSlope(sym, tf, short_look));
+   double long_s  = Pts(sym, CloseSlope(sym, tf, long_look));
+   return short_s - long_s * 0.5;
+  }
+
+//+------------------------------------------------------------------+
+// Мгновенный предикт: LTF = куда пойдёт сейчас; H1 = фильтр, не диктатор.
 MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
                           const double min_big_usd,
                           const double min_enter_conf)
@@ -215,29 +245,55 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
    double m15_pts = Pts(sym, CloseSlope(sym, PERIOD_M15, 4));
    double h1_pts = Pts(sym, CloseSlope(sym, PERIOD_H1, 3));
    double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3));
+   double m5_fast = Pts(sym, CloseSlope(sym, PERIOD_M5, 2));
+   double acc_m1 = ImpulseAccel(sym, PERIOD_M1, 3, 8);
+   double acc_m5 = ImpulseAccel(sym, PERIOD_M5, 2, 5);
 
    const int d_m5  = SlopeDir(f.m5_pts, thr_m5);
    const int d_m15 = SlopeDir(m15_pts, thr_m15);
    const int d_h1  = SlopeDir(h1_pts, thr_h1);
    const int d_m1  = SlopeDir(f.m1_pts, thr_m1);
 
+   // --- Веса: ближний срок важнее для скальпа (деньги делаются на M1–M15) ---
+   double micro_buy = 0, micro_sell = 0; // M1+M5+M15
+   double macro_buy = 0, macro_sell = 0; // H1
+
    VoteSlope(f.m5_pts, thr_m5, f.buy_v, f.sell_v, f.reason, "M5");
    VoteSlope(m15_pts, thr_m15, f.buy_v, f.sell_v, f.reason, "M15");
    VoteSlope(h1_pts, thr_h1, f.buy_v, f.sell_v, f.reason, "H1");
    VoteSlope(f.m1_pts, thr_m1, f.buy_v, f.sell_v, f.reason, "M1");
-   if(d_m5  > 0) f.buy_w += 1.5; else if(d_m5  < 0) f.sell_w += 1.5;
-   if(d_m15 > 0) f.buy_w += 2.0; else if(d_m15 < 0) f.sell_w += 2.0;
-   if(d_h1  > 0) f.buy_w += 2.5; else if(d_h1  < 0) f.sell_w += 2.5;
-   if(d_m1  > 0) f.buy_w += 1.0; else if(d_m1  < 0) f.sell_w += 1.0;
+
+   if(d_m1  > 0) micro_buy += 2.2; else if(d_m1  < 0) micro_sell += 2.2;
+   if(d_m5  > 0) micro_buy += 2.8; else if(d_m5  < 0) micro_sell += 2.8;
+   if(d_m15 > 0) micro_buy += 2.4; else if(d_m15 < 0) micro_sell += 2.4;
+   if(d_h1  > 0) macro_buy += 1.6; else if(d_h1  < 0) macro_sell += 1.6; // H1 слабее!
 
    const int m5_now = FormingCandleDir(sym, PERIOD_M5, f.reason, "M5now");
    const int m15_now = FormingCandleDir(sym, PERIOD_M15, f.reason, "M15now");
    const int h1_now = FormingCandleDir(sym, PERIOD_H1, f.reason, "H1now");
    const int h1_cl = ClosedCandleDir(sym, PERIOD_H1, f.reason, "H1cl");
-   if(m5_now > 0)  { f.buy_v++; f.buy_w += 1.2; } else if(m5_now < 0)  { f.sell_v++; f.sell_w += 1.2; }
-   if(m15_now > 0) { f.buy_v++; f.buy_w += 1.6; } else if(m15_now < 0) { f.sell_v++; f.sell_w += 1.6; }
-   if(h1_now > 0)  { f.buy_v++; f.buy_w += 2.0; } else if(h1_now < 0)  { f.sell_v++; f.sell_w += 2.0; }
-   if(h1_cl > 0)   { f.buy_v++; f.buy_w += 3.0; } else if(h1_cl < 0)   { f.sell_v++; f.sell_w += 3.0; }
+   const int m5_cl = ClosedCandleDir(sym, PERIOD_M5, f.reason, "M5cl");
+   const int m15_cl = ClosedCandleDir(sym, PERIOD_M15, f.reason, "M15cl");
+
+   if(m5_now > 0)  { f.buy_v++; micro_buy += 1.8; } else if(m5_now < 0)  { f.sell_v++; micro_sell += 1.8; }
+   if(m15_now > 0) { f.buy_v++; micro_buy += 1.5; } else if(m15_now < 0) { f.sell_v++; micro_sell += 1.5; }
+   if(m5_cl > 0)   { f.buy_v++; micro_buy += 1.4; } else if(m5_cl < 0)   { f.sell_v++; micro_sell += 1.4; }
+   if(m15_cl > 0)  { f.buy_v++; micro_buy += 1.2; } else if(m15_cl < 0)  { f.sell_v++; micro_sell += 1.2; }
+   // H1 cl/now — только лёгкий фильтр (раньше +3 ломало bias в BUY)
+   if(h1_now > 0)  { f.buy_v++; macro_buy += 0.9; } else if(h1_now < 0)  { f.sell_v++; macro_sell += 0.9; }
+   if(h1_cl > 0)   { f.buy_v++; macro_buy += 1.1; } else if(h1_cl < 0)   { f.sell_v++; macro_sell += 1.1; }
+
+   // Серия закрытых M5 — предикт продолжения
+   int run_up = ClosedRun(sym, PERIOD_M5, 3, 1);
+   int run_dn = ClosedRun(sym, PERIOD_M5, 3, -1);
+   if(run_up >= 2) { micro_buy += 1.3; f.reason += "runM5↑ "; }
+   if(run_dn >= 2) { micro_sell += 1.3; f.reason += "runM5↓ "; }
+
+   // Ускорение импульса
+   if(acc_m1 > thr_m1 * 0.25) { micro_buy += 1.2; f.reason += "accM1↑ "; }
+   else if(acc_m1 < -thr_m1 * 0.25) { micro_sell += 1.2; f.reason += "accM1↓ "; }
+   if(acc_m5 > thr_m5 * 0.20) { micro_buy += 1.0; f.reason += "accM5↑ "; }
+   else if(acc_m5 < -thr_m5 * 0.20) { micro_sell += 1.0; f.reason += "accM5↓ "; }
 
    bool above_ema = false, below_ema = false;
    int ema = iMA(sym, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
@@ -249,73 +305,101 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
         {
          double bid = SymbolInfoDouble(sym, SYMBOL_BID);
          double dead = SymbolInfoDouble(sym, SYMBOL_POINT) * MathMax(thr_m1 * 0.2, 10.0);
+         // EMA лагает — малый вес; при конфликте с M1/M5 почти игнор
          if(bid > e[0] + dead)
-           { f.buy_v++; f.buy_w += 1.5; above_ema = true; f.reason += "aboveEMA5 "; }
+           { above_ema = true; f.reason += "aboveEMA5 "; micro_buy += 0.6; }
          else if(bid < e[0] - dead)
-           { f.sell_v++; f.sell_w += 1.5; below_ema = true; f.reason += "belowEMA5 "; }
+           { below_ema = true; f.reason += "belowEMA5 "; micro_sell += 0.6; }
          else f.reason += "nearEMA5 ";
         }
       IndicatorRelease(ema);
      }
 
    if(m1_fast >= thr_m1 * 0.45)
-     { f.reason += "M1f↑ "; f.buy_w += 0.8; }
+     { f.reason += "M1f↑ "; micro_buy += 1.1; }
    else if(m1_fast <= -thr_m1 * 0.45)
-     { f.reason += "M1f↓ "; f.sell_w += 0.8; }
+     { f.reason += "M1f↓ "; micro_sell += 1.1; }
 
-   f.reason += StringFormat("|M1=%.0f M5=%.0f M15=%.0f H1=%.0f", f.m1_pts, f.m5_pts, m15_pts, h1_pts);
+   if(m5_fast >= thr_m5 * 0.35)
+     { micro_buy += 0.8; }
+   else if(m5_fast <= -thr_m5 * 0.35)
+     { micro_sell += 0.8; }
 
-   if(f.buy_w > f.sell_w + 0.15)
-      f.dir = ORDER_TYPE_BUY;
-   else if(f.sell_w > f.buy_w + 0.15)
-      f.dir = ORDER_TYPE_SELL;
+   f.buy_w = micro_buy + macro_buy;
+   f.sell_w = micro_sell + macro_sell;
+   f.reason += StringFormat("|μB%.1f/S%.1f H1B%.1f/S%.1f |M1=%.0f M5=%.0f M15=%.0f H1=%.0f",
+                            micro_buy, micro_sell, macro_buy, macro_sell,
+                            f.m1_pts, f.m5_pts, m15_pts, h1_pts);
+
+   // Направление для СКАЛЬПА = микро-поток (куда пойдёт ближайшие минуты)
+   ENUM_ORDER_TYPE micro_dir = ORDER_TYPE_BUY;
+   if(micro_sell > micro_buy + 0.2)
+      micro_dir = ORDER_TYPE_SELL;
+   else if(micro_buy > micro_sell + 0.2)
+      micro_dir = ORDER_TYPE_BUY;
    else
-      f.dir = (f.m1_pts >= 0.0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      micro_dir = (m1_fast >= 0.0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
 
-   double total_w = f.buy_w + f.sell_w;
-   if(total_w <= 0.01)
+   ENUM_ORDER_TYPE macro_dir = ORDER_TYPE_BUY;
+   if(macro_sell > macro_buy + 0.1)
+      macro_dir = ORDER_TYPE_SELL;
+   else if(macro_buy > macro_sell + 0.1)
+      macro_dir = ORDER_TYPE_BUY;
+   else
+      macro_dir = (h1_pts >= 0.0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+
+   const bool conflict = (micro_dir != macro_dir);
+   // Bias на экране = прогноз ближайшего хода (микро), не «залипший» H1 BUY
+   f.dir = micro_dir;
+
+   double micro_tot = micro_buy + micro_sell;
+   if(micro_tot <= 0.01)
       f.conf = 0.0;
    else
-      f.conf = 100.0 * MathAbs(f.buy_w - f.sell_w) / total_w;
+      f.conf = 100.0 * MathAbs(micro_buy - micro_sell) / micro_tot;
+   // Конфликт H1 vs LTF → режем уверенность (не входим «в лоб»)
+   if(conflict)
+      f.conf *= 0.55;
 
-   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.15 && m1_fast >= -thr_m1 * 0.35);
-   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.15 && m1_fast <= thr_m1 * 0.35);
+   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.15 && m1_fast >= -thr_m1 * 0.25);
+   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.15 && m1_fast <= thr_m1 * 0.25);
 
+   // Структура: LTF обязательны; H1 желателен, но не обязателен при сильном микро
    const bool struct_buy =
-      (h1_cl > 0 || h1_pts >= thr_h1 * 0.28 || h1_now > 0) &&
-      (m5_now > 0 || f.m5_pts >= thr_m5 * 0.20 || m15_now > 0 || m15_pts > 0) &&
-      (above_ema || m15_now > 0 || f.m5_pts > 0);
+      (m5_now > 0 || f.m5_pts >= thr_m5 * 0.20 || m15_now > 0 || m5_cl > 0) &&
+      (m15_pts > -thr_m15 * 0.15 || m15_now > 0 || m15_cl > 0) &&
+      (macro_dir == ORDER_TYPE_BUY || (!conflict && micro_buy > micro_sell + 3.0));
    const bool struct_sell =
-      (h1_cl < 0 || h1_pts <= -thr_h1 * 0.28 || h1_now < 0) &&
-      (m5_now < 0 || f.m5_pts <= -thr_m5 * 0.20 || m15_now < 0 || m15_pts < 0) &&
-      (below_ema || m15_now < 0 || f.m5_pts < 0);
+      (m5_now < 0 || f.m5_pts <= -thr_m5 * 0.20 || m15_now < 0 || m5_cl < 0) &&
+      (m15_pts < thr_m15 * 0.15 || m15_now < 0 || m15_cl < 0) &&
+      (macro_dir == ORDER_TYPE_SELL || (!conflict && micro_sell > micro_buy + 3.0));
 
-   const bool wick_blocks_buy  = (h1_now < 0 && h1_cl <= 0);
-   const bool wick_blocks_sell = (h1_now > 0 && h1_cl >= 0);
+   // Блок: свеча H1 против при слабом микро
+   const bool wick_blocks_buy  = (h1_now < 0 && h1_cl < 0 && micro_buy < micro_sell + 2.0);
+   const bool wick_blocks_sell = (h1_now > 0 && h1_cl > 0 && micro_sell < micro_buy + 2.0);
 
-   const bool h1_up = (h1_cl > 0 || (h1_now > 0 && h1_cl >= 0));
-   const bool h1_dn = (h1_cl < 0 || (h1_now < 0 && h1_cl <= 0));
-   const bool m15_up = (m15_now > 0 || (m15_pts >= thr_m15 * 0.20 && m15_now >= 0));
-   const bool m15_dn = (m15_now < 0 || (m15_pts <= -thr_m15 * 0.20 && m15_now <= 0));
-   const bool m5_up = (m5_now > 0 || (f.m5_pts >= thr_m5 * 0.20 && m5_now >= 0));
-   const bool m5_dn = (m5_now < 0 || (f.m5_pts <= -thr_m5 * 0.20 && m5_now <= 0));
+   const bool h1_up = (h1_cl > 0 || (h1_now > 0 && h1_cl >= 0) || h1_pts >= thr_h1 * 0.2);
+   const bool h1_dn = (h1_cl < 0 || (h1_now < 0 && h1_cl <= 0) || h1_pts <= -thr_h1 * 0.2);
+   const bool m15_up = (m15_now > 0 || m15_cl > 0 || (m15_pts >= thr_m15 * 0.20 && m15_now >= 0));
+   const bool m15_dn = (m15_now < 0 || m15_cl < 0 || (m15_pts <= -thr_m15 * 0.20 && m15_now <= 0));
+   const bool m5_up = (m5_now > 0 || m5_cl > 0 || (f.m5_pts >= thr_m5 * 0.20 && m5_now >= 0));
+   const bool m5_dn = (m5_now < 0 || m5_cl < 0 || (f.m5_pts <= -thr_m5 * 0.20 && m5_now <= 0));
    const bool m1_up = (m1_fast >= thr_m1 * 0.25 || (f.m1_pts >= thr_m1 * 0.20 && m1_fast >= 0));
    const bool m1_dn = (m1_fast <= -thr_m1 * 0.25 || (f.m1_pts <= -thr_m1 * 0.20 && m1_fast <= 0));
 
-   // Expectancy: потенциал ≈ ATR(M5)+часть M15 в деньгах (цель скальпа по тренду)
    double atr_use = atr_m5 * 1.0 + atr_m15 * 0.35;
    if(atr_h1 > atr_m15 * 2.2)
-      atr_use *= 1.20; // расширенная волатильность дня
+      atr_use *= 1.20;
    f.expected_usd = EstimatePointsUsd(sym, atr_use, lot_for_expect);
 
-   // Align score (Elder Triple Screen idea: HTF + LTF)
+   // Align считаем относительно ПРОГНОЗА (микро-dir)
    if(f.dir == ORDER_TYPE_BUY)
      {
       if(h1_up) f.align_score++;
       if(m15_up) f.align_score++;
       if(m5_up) f.align_score++;
       if(m1_up) f.align_score++;
-      if(above_ema) f.align_score++;
+      if(above_ema && !m5_dn) f.align_score++; // EMA не плюсуем, если M5 уже ↓
      }
    else
      {
@@ -323,27 +407,35 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       if(m15_dn) f.align_score++;
       if(m5_dn) f.align_score++;
       if(m1_dn) f.align_score++;
-      if(below_ema) f.align_score++;
+      if(below_ema && !m5_up) f.align_score++;
      }
 
-   const bool aligned_buy  = h1_up && m15_up && m5_up && m1_up && above_ema && !wick_blocks_buy;
-   const bool aligned_sell = h1_dn && m15_dn && m5_dn && m1_dn && below_ema && !wick_blocks_sell;
+   // Полное выравнивание: 3 LTF + микро без конфликта ИЛИ все 4 ТФ
+   const bool ltf_buy  = m15_up && m5_up && m1_up;
+   const bool ltf_sell = m15_dn && m5_dn && m1_dn;
+   const bool aligned_buy  = ltf_buy && (h1_up || !conflict) && m1_with_buy && !wick_blocks_buy;
+   const bool aligned_sell = ltf_sell && (h1_dn || !conflict) && m1_with_sell && !wick_blocks_sell;
    f.aligned = (aligned_buy || aligned_sell);
 
-   // Классификация возможности: SMALL / MID / BIG
-   // BIG = большой $ потенциал + сильный consensus + выравнивание ТФ
    const bool money_big = (f.expected_usd >= min_big_usd);
    const bool money_mid = (f.expected_usd >= min_big_usd * 0.55);
    const bool conf_big  = (f.conf >= min_enter_conf);
    const bool conf_mid  = (f.conf >= min_enter_conf * 0.85);
-   const bool weight_gap = MathAbs(f.buy_w - f.sell_w) >= 4.0;
+   const bool weight_gap = MathAbs(micro_buy - micro_sell) >= 3.5;
 
-   if(money_big && conf_big && f.align_score >= 4 && weight_gap)
+   // Конфликт H1↔LTF → максимум MID (не BIG) — меньше ложных входов «постаршему ТФ»
+   if(conflict)
+      f.opportunity = (money_mid && conf_mid && f.align_score >= 3) ? OPP_MID : OPP_SMALL;
+   else if(money_big && conf_big && f.align_score >= 4 && weight_gap)
       f.opportunity = OPP_BIG;
    else if(f.aligned && money_mid && conf_mid && f.align_score >= 4)
-      f.opportunity = OPP_BIG; // полное выравнивание = тоже BIG
+      f.opportunity = OPP_BIG;
+   else if(ltf_buy && f.dir == ORDER_TYPE_BUY && money_mid && f.conf >= min_enter_conf * 0.90 && weight_gap)
+      f.opportunity = OPP_BIG;
+   else if(ltf_sell && f.dir == ORDER_TYPE_SELL && money_mid && f.conf >= min_enter_conf * 0.90 && weight_gap)
+      f.opportunity = OPP_BIG;
    else if(f.align_score >= 5 && f.conf >= min_enter_conf * 0.90 && money_mid)
-      f.opportunity = OPP_BIG; // 5/5 ТФ + деньги ≥ mid → институциональный confluence
+      f.opportunity = OPP_BIG;
    else if(money_mid && conf_mid && f.align_score >= 3)
       f.opportunity = OPP_MID;
    else
@@ -351,33 +443,43 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
 
    string opp_tag = (f.opportunity == OPP_BIG ? "КРУПНЫЙ"
                      : (f.opportunity == OPP_MID ? "СРЕДНИЙ" : "МЕЛКИЙ"));
+   string forecast = (f.dir == ORDER_TYPE_BUY ? "BUY" : "SELL");
+   if(conflict)
+      forecast = StringFormat("%s≠H1", forecast);
 
    f.analysis = StringFormat(
-      "H1:%s M15:%s M5:%s M1:%s EMA5:%s | вес BUY %.1f / SELL %.1f | %s ~$%.0f align=%d",
+      "H1:%s M15:%s M5:%s M1:%s EMA:%s | μ BUY %.1f/SELL %.1f | %s ~$%.0f align=%d%s",
       h1_up ? "↑" : (h1_dn ? "↓" : "="),
       m15_up ? "↑" : (m15_dn ? "↓" : "="),
       m5_up ? "↑" : (m5_dn ? "↓" : "="),
       m1_up ? "↑" : (m1_dn ? "↓" : "="),
       above_ema ? "выше" : (below_ema ? "ниже" : "около"),
-      f.buy_w, f.sell_w, opp_tag, f.expected_usd, f.align_score);
+      micro_buy, micro_sell, opp_tag, f.expected_usd, f.align_score,
+      conflict ? " КОНФЛИКТ" : "");
 
-   // Вход ТОЛЬКО в BIG. Без soft-entry по conf 50% — именно он давал −$12 на мелких сетах.
    bool enter_buy = false;
    bool enter_sell = false;
 
-   if(f.opportunity == OPP_BIG)
+   if(f.opportunity == OPP_BIG && !conflict)
      {
       if(f.dir == ORDER_TYPE_BUY && struct_buy && m1_with_buy && !wick_blocks_buy &&
-         f.buy_w > f.sell_w + 1.2 && f.align_score >= 4)
+         micro_buy > micro_sell + 1.5 && f.align_score >= 4)
          enter_buy = true;
       if(f.dir == ORDER_TYPE_SELL && struct_sell && m1_with_sell && !wick_blocks_sell &&
-         f.sell_w > f.buy_w + 1.2 && f.align_score >= 4)
+         micro_sell > micro_buy + 1.5 && f.align_score >= 4)
          enter_sell = true;
-      // Полное выравнивание всех ТФ — разрешаем даже если M1 чуть шумит
-      if(aligned_buy && f.buy_w >= f.sell_w)
+      if(aligned_buy && micro_buy >= micro_sell)
         { enter_buy = true; f.conf = MathMax(f.conf, min_enter_conf); }
-      if(aligned_sell && f.sell_w >= f.buy_w)
+      if(aligned_sell && micro_sell >= micro_buy)
         { enter_sell = true; f.conf = MathMax(f.conf, min_enter_conf); }
+     }
+   // Сильный LTF cascade без идеального H1 — всё же BIG, если макро не против жёстко
+   if(f.opportunity == OPP_BIG && conflict && MathAbs(micro_buy - micro_sell) >= 5.0 && f.conf >= min_enter_conf)
+     {
+      // не входим против жёсткого H1 cl+now — только ждём
+      f.opportunity = OPP_MID;
+      enter_buy = false;
+      enter_sell = false;
      }
 
    if(enter_buy)
@@ -385,7 +487,7 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
       f.signal = SIG_BUY;
-      f.reason = "BIG " + f.reason;
+      f.reason = "PRED_BUY " + f.reason;
       f.signal_txt = StringFormat("СИГНАЛ: BUY %.0f%% КРУПНЫЙ ~$%.0f → ВХОД", f.conf, f.expected_usd);
      }
    else if(enter_sell)
@@ -393,21 +495,20 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       f.dir = ORDER_TYPE_SELL;
       f.clear = true;
       f.signal = SIG_SELL;
-      f.reason = "BIG " + f.reason;
+      f.reason = "PRED_SELL " + f.reason;
       f.signal_txt = StringFormat("СИГНАЛ: SELL %.0f%% КРУПНЫЙ ~$%.0f → ВХОД", f.conf, f.expected_usd);
      }
    else
      {
       f.clear = false;
       f.signal = SIG_WAIT;
-      string bias = (f.dir == ORDER_TYPE_BUY ? "BUY" : "SELL");
       if(f.opportunity == OPP_SMALL)
-         f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ МЕЛКИЙ (bias %s %.0f%% ~$%.0f)", bias, f.conf, f.expected_usd);
+         f.signal_txt = StringFormat("ЖДЁМ %s %.0f%% · МЕЛКИЙ ~$%.0f", forecast, f.conf, f.expected_usd);
       else if(f.opportunity == OPP_MID)
-         f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ СРЕДНИЙ (bias %s %.0f%% ~$%.0f)", bias, f.conf, f.expected_usd);
+         f.signal_txt = StringFormat("ЖДЁМ %s %.0f%% · СРЕДНИЙ ~$%.0f", forecast, f.conf, f.expected_usd);
       else
-         f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ КРУПНЫЙ не готов (bias %s %.0f%% ~$%.0f)", bias, f.conf, f.expected_usd);
-      f.reason = "FILTER_" + opp_tag + " " + f.reason;
+         f.signal_txt = StringFormat("ЖДЁМ %s %.0f%% · КРУПНЫЙ не готов ~$%.0f", forecast, f.conf, f.expected_usd);
+      f.reason = "FILTER_" + opp_tag + (conflict ? "_CONFLICT " : " ") + f.reason;
      }
 
    return f;
