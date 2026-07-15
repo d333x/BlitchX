@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.93 — профит: reachable lock + hold шума + вход по тренду        |
+//|  v3.94 — мгновенный СИГНАЛ на графике, торговля строго по нему      |
 //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.93"
-#property description "Профит$: grace60, lock$1.8, peak-arm, вход без M5-doji блока."
+#property version   "3.94"
+#property description "Сигнал BUY/SELL сразу. Анализ ТФ с %. Вход только по сигналу."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -102,7 +102,12 @@ double g_score_buy[MAX_SYMS];
 double g_score_sell[MAX_SYMS];
 string g_score_why[MAX_SYMS];
 string g_wait_why[MAX_SYMS];
+string g_signal_txt[MAX_SYMS];
+string g_analysis[MAX_SYMS];
+double g_conf[MAX_SYMS];
+bool   g_signal_enter[MAX_SYMS];
 ulong  g_last_pulse_ms = 0;
+ulong  g_last_signal_print_ms = 0;
 
 datetime g_day_start = 0;
 double   g_day_pnl = 0.0;
@@ -263,6 +268,10 @@ int OnInit()
       g_score_sell[i] = 0;
       g_score_why[i] = "-";
       g_wait_why[i] = "";
+      g_signal_txt[i] = "СИГНАЛ: …";
+      g_analysis[i] = "-";
+      g_conf[i] = 0;
+      g_signal_enter[i] = false;
       if(g_ema_fast[i] == INVALID_HANDLE || g_ema_slow[i] == INVALID_HANDLE || g_atr[i] == INVALID_HANDLE)
         {
          PrintFormat("Индикаторы не созданы для %s", g_syms[i]);
@@ -283,9 +292,12 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.93b HOLD | chart=%s | lot=%.2f | lock$=%.2f | cut=$%.2f grace=%ds | maxPos=%d",
-               _Symbol, InpLot, InpMinProfitMoney, InpBasketCutLoss, InpCutGraceSec, InpMaxPositions);
+   PrintFormat("ProfitScalper v3.94 SIGNAL | chart=%s | lot=%.2f | lock$=%.2f | cut=$%.2f grace=%ds",
+               _Symbol, InpLot, InpMinProfitMoney, InpBasketCutLoss, InpCutGraceSec);
    g_last_pulse_ms = 0;
+   g_last_signal_print_ms = 0;
+   RefreshAllSignals();
+   UpdatePanel();
    return INIT_SUCCEEDED;
   }
 
@@ -299,6 +311,8 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_ema_slow[i]);
       IndicatorRelease(g_atr[i]);
      }
+   ObjectDelete(0, "PS_SIG");
+   ObjectDelete(0, "PS_AN");
    Comment("");
    Print("ProfitScalper остановлен");
   }
@@ -316,30 +330,102 @@ void PulseAlive()
    MarketFlow flow = ReadMarketFlow(sym);
    int open_n = CountOurPositions(sym);
    PrintFormat(
-      "PULSE %s | %s clear=%s B%d/S%d open=%d | net$=%.2f приход$=%.2f расход$=%.2f trades=%d pause=%s | %s",
+      "PULSE %s | %s conf=%.0f enter=%s B%d/S%d open=%d | net$=%.2f приход$=%.2f расход$=%.2f | %s | %s",
       sym,
       flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
+      flow.conf,
       flow.clear ? "YES" : "no",
       flow.buy_v, flow.sell_v, open_n,
       g_day_pnl, g_day_income, g_day_expense,
-      g_trades_today,
-      g_trading_paused ? "YES" : "no",
-      flow.reason);
+      flow.signal_txt,
+      flow.analysis);
   }
 
 //+------------------------------------------------------------------+
-// Пауза блокирует только НОВЫЕ входы. LOCK/CUT всегда работают.
-void ManageOpenRisk()
+// Обновляет предикт/сигнал СРАЗУ (каждый тик), даже без сделки.
+void RefreshAllSignals()
   {
-   ManageAllPositions();
-   for(int i = 0; i < g_sym_count; i++)
-      ProtectAgainstFlow(i);
+   for(int idx = 0; idx < g_sym_count; idx++)
+     {
+      const string sym = g_syms[idx];
+      MarketFlow flow = ReadMarketFlow(sym);
+      KnowledgeScore ks = EvaluateKnowledge(sym, InpSignalTF, true, false);
+
+      g_score_buy[idx] = ks.buy;
+      g_score_sell[idx] = ks.sell;
+      g_score_why[idx] = flow.reason;
+      g_pred_gap[idx] = MathAbs(ks.buy - ks.sell);
+      g_conf[idx] = flow.conf;
+      g_signal_txt[idx] = flow.signal_txt;
+      g_analysis[idx] = flow.analysis;
+      g_signal_enter[idx] = flow.clear;
+      g_pred_side[idx] = (flow.dir == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
+      g_pred_strong[idx] = (InpSmartBigProfit && flow.clear && flow.conf >= 55.0);
+      g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
+
+      if(flow.clear)
+         g_wait_why[idx] = "";
+      else
+         g_wait_why[idx] = StringFormat(
+            "Ждём вход: bias %s conf=%.0f%% | %s",
+            flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
+            flow.conf, flow.analysis);
+
+      // Печать смены сигнала не чаще 3 сек
+      if(g_last_signal_print_ms == 0 ||
+         (GetTickCount64() - g_last_signal_print_ms) >= 3000)
+        {
+         g_last_signal_print_ms = GetTickCount64();
+         PrintFormat("SIGNAL %s | %s | %s", sym, flow.signal_txt, flow.analysis);
+        }
+     }
+   DrawSignalOnChart();
+  }
+
+//+------------------------------------------------------------------+
+void DrawSignalOnChart()
+  {
+   if(g_sym_count <= 0) return;
+   const int i = 0;
+   color clr = clrSilver;
+   if(g_signal_enter[i] && g_pred_side[i] == "UP/BUY") clr = clrLime;
+   else if(g_signal_enter[i] && g_pred_side[i] == "DOWN/SELL") clr = clrTomato;
+   else if(StringFind(g_pred_side[i], "BUY") >= 0) clr = clrDodgerBlue;
+   else if(StringFind(g_pred_side[i], "SELL") >= 0) clr = clrOrangeRed;
+
+   if(ObjectFind(0, "PS_SIG") < 0)
+     {
+      ObjectCreate(0, "PS_SIG", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "PS_SIG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, "PS_SIG", OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, "PS_SIG", OBJPROP_YDISTANCE, 18);
+      ObjectSetInteger(0, "PS_SIG", OBJPROP_FONTSIZE, 14);
+      ObjectSetString(0, "PS_SIG", OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, "PS_SIG", OBJPROP_SELECTABLE, false);
+     }
+   ObjectSetString(0, "PS_SIG", OBJPROP_TEXT, g_signal_txt[i]);
+   ObjectSetInteger(0, "PS_SIG", OBJPROP_COLOR, clr);
+
+   if(ObjectFind(0, "PS_AN") < 0)
+     {
+      ObjectCreate(0, "PS_AN", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "PS_AN", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, "PS_AN", OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, "PS_AN", OBJPROP_YDISTANCE, 40);
+      ObjectSetInteger(0, "PS_AN", OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, "PS_AN", OBJPROP_FONT, "Consolas");
+      ObjectSetInteger(0, "PS_AN", OBJPROP_COLOR, clrSilver);
+      ObjectSetInteger(0, "PS_AN", OBJPROP_SELECTABLE, false);
+     }
+   ObjectSetString(0, "PS_AN", OBJPROP_TEXT, g_analysis[i]);
+   ChartRedraw(0);
   }
 
 //+------------------------------------------------------------------+
 void OnTimer()
   {
    ResetDayIfNeeded();
+   RefreshAllSignals();
    PulseAlive();
    UpdatePanel();
    ManageOpenRisk();
@@ -365,6 +451,7 @@ void OnTimer()
 void OnTick()
   {
    ResetDayIfNeeded();
+   RefreshAllSignals(); // сигнал сразу на тике
    PulseAlive();
    UpdatePanel();
    ManageOpenRisk();
@@ -386,6 +473,15 @@ void OnTick()
   }
 
 //+------------------------------------------------------------------+
+// Пауза блокирует только НОВЫЕ входы. LOCK/CUT всегда работают.
+void ManageOpenRisk()
+  {
+   ManageAllPositions();
+   for(int i = 0; i < g_sym_count; i++)
+      ProtectAgainstFlow(i);
+  }
+
+//+------------------------------------------------------------------+
 void FarmSymbol(const int idx)
   {
    const string sym = g_syms[idx];
@@ -403,9 +499,15 @@ void FarmSymbol(const int idx)
       return;
      }
 
-   ENUM_ORDER_TYPE type;
-   string reason;
-   bool can_trade = ResolveDir(idx, score, type, reason);
+   ENUM_ORDER_TYPE type = (g_pred_side[idx] == "DOWN/SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   string reason = StringFormat("%s | work-by-signal conf=%.0f lock$=%.2f | %s",
+                                g_signal_txt[idx], g_conf[idx], g_lock_target[idx], g_analysis[idx]);
+   bool can_trade = g_signal_enter[idx];
+
+   if(InpDirection == DIR_BUY)
+     { type = ORDER_TYPE_BUY; can_trade = true; reason = "fixed BUY"; }
+   else if(InpDirection == DIR_SELL)
+     { type = ORDER_TYPE_SELL; can_trade = true; reason = "fixed SELL"; }
 
    // Не доливаем против текущего потока (и против уже открытой стороны)
    if(open_now > 0 && can_trade)
@@ -425,7 +527,7 @@ void FarmSymbol(const int idx)
          bool mismatch = ((our == POSITION_TYPE_BUY && type == ORDER_TYPE_SELL) ||
                           (our == POSITION_TYPE_SELL && type == ORDER_TYPE_BUY));
          if(mismatch)
-            return; // ждём ProtectAgainstFlow, не открываем хедж-бред
+            return;
         }
      }
 
@@ -464,7 +566,6 @@ void FarmSymbol(const int idx)
         }
      }
 
-   // Меньше «ковыряния»: на профит-режиме всегда 1
    int basket = MathMin(InpBasketOpen, InpMaxPositions);
    if(!g_pred_strong[idx])
       basket = 1;
@@ -577,22 +678,33 @@ void UpdatePrediction(const int idx, const MarketScore &s)
   }
 
 //+------------------------------------------------------------------+
-// true = можно открывать; false = ждём (анализ всё равно в панели)
+// true = можно открывать; false = ждём (сигнал всё равно уже в панели)
 bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, string &reason)
   {
-   g_wait_why[idx] = "";
-
    if(InpDirection == DIR_BUY)
-     { type = ORDER_TYPE_BUY; reason = "fixed BUY"; g_pred_side[idx]="UP/BUY"; return true; }
+     {
+      type = ORDER_TYPE_BUY; reason = "fixed BUY";
+      g_pred_side[idx]="UP/BUY"; g_signal_txt[idx]="СИГНАЛ: BUY (fixed)"; g_signal_enter[idx]=true;
+      return true;
+     }
    if(InpDirection == DIR_SELL)
-     { type = ORDER_TYPE_SELL; reason = "fixed SELL"; g_pred_side[idx]="DOWN/SELL"; return true; }
+     {
+      type = ORDER_TYPE_SELL; reason = "fixed SELL";
+      g_pred_side[idx]="DOWN/SELL"; g_signal_txt[idx]="СИГНАЛ: SELL (fixed)"; g_signal_enter[idx]=true;
+      return true;
+     }
 
+   // Свежий анализ — торговля только по сигналу
    MarketFlow flow = ReadMarketFlow(g_syms[idx]);
    KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
    g_score_buy[idx] = ks.buy;
    g_score_sell[idx] = ks.sell;
    g_score_why[idx] = flow.reason;
    g_pred_gap[idx] = MathAbs(ks.buy - ks.sell);
+   g_conf[idx] = flow.conf;
+   g_signal_txt[idx] = flow.signal_txt;
+   g_analysis[idx] = flow.analysis;
+   g_signal_enter[idx] = flow.clear;
    type = flow.dir;
    g_pred_side[idx] = (type == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
 
@@ -601,30 +713,23 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
       g_pred_strong[idx] = false;
       g_lock_target[idx] = InpMinProfitMoney;
       g_wait_why[idx] = StringFormat(
-         "ЖДЁМ ясный ход рынка: голоса BUY %d / SELL %d | M1=%.0fpts. Не торгуем шум.",
-         flow.buy_v, flow.sell_v, flow.m1_pts);
-      if(g_last_skip_ms[idx] == 0 ||
-         (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
-        {
-         g_last_skip_ms[idx] = GetTickCount64();
-         PrintFormat("WAIT %s | %s | %s", g_syms[idx], g_wait_why[idx], flow.reason);
-        }
-      reason = "WAIT chop " + flow.reason;
+         "Сигнал ещё не готов к входу (bias %s %.0f%%). %s",
+         type == ORDER_TYPE_BUY ? "BUY" : "SELL", flow.conf, flow.analysis);
+      reason = "WAIT " + flow.signal_txt + " | " + flow.reason;
       return false;
      }
 
-   g_pred_strong[idx] = (InpSmartBigProfit && flow.clear &&
-                         MathAbs(flow.buy_v - flow.sell_v) >= 3 &&
-                         MathAbs(flow.m1_pts) >= 80.0);
+   g_pred_strong[idx] = (InpSmartBigProfit && flow.clear && flow.conf >= 55.0);
    g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
    g_wait_why[idx] = "";
-   reason = StringFormat("FLOW %s B%d/S%d | BUY=%.1f SELL=%.1f lock$=%.2f%s | %s",
+   reason = StringFormat("%s | FLOW %s conf=%.0f B%d/S%d w%.1f/%.1f lock$=%.2f%s | %s",
+                         flow.signal_txt,
                          type == ORDER_TYPE_BUY ? "BUY" : "SELL",
-                         flow.buy_v, flow.sell_v,
-                         g_score_buy[idx], g_score_sell[idx],
+                         flow.conf, flow.buy_v, flow.sell_v,
+                         flow.buy_w, flow.sell_w,
                          g_lock_target[idx],
                          g_pred_strong[idx] ? " BIG" : "",
-                         flow.reason);
+                         flow.analysis);
    return true;
   }
 
@@ -1068,19 +1173,23 @@ void UpdatePanel()
    for(int i = 0; i < g_sym_count; i++)
      {
       if(i > 0) list += "\n----\n";
-      string wait = (g_wait_why[i] != "" ? ("\n" + g_wait_why[i]) : "");
+      string action = g_signal_enter[i] ? "→ РАБОТАЕМ ПО СИГНАЛУ" : "→ ждём подтверждение";
       list += StringFormat(
-                 "%s  pos=%d\nАНАЛИЗ СВЕЧЕЙ (не рандом):\nBUY %.1f  vs  SELL %.1f  →  %s%s\nцель lock $%.2f | gap %.1f\n%s%s",
-                 g_syms[i], CountOurPositions(g_syms[i]),
-                 g_score_buy[i], g_score_sell[i], g_pred_side[i],
+                 "%s\n%s\n%s\nАНАЛИЗ: BUY %.1f vs SELL %.1f (%.0f%%) %s%s\npos=%d | lock $%.2f\n%s",
+                 g_syms[i],
+                 g_signal_txt[i],
+                 g_analysis[i],
+                 g_score_buy[i], g_score_sell[i], g_conf[i],
+                 g_pred_side[i],
                  g_pred_strong[i] ? " [BIG]" : "",
-                 g_lock_target[i], g_pred_gap[i],
-                 g_score_why[i], wait);
+                 CountOurPositions(g_syms[i]),
+                 g_lock_target[i],
+                 action);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.93b HOLD\n%s\n————\nnet$ %.2f | приход$ %.2f | расход$ %.2f\ntrades %d | lot %.2f | lock$%.1f cut$%.0f grace%ds | pause %s\nLOCK всегда; пауза = только новые входы.",
+              "ProfitScalper v3.94 SIGNAL\n%s\n————\nnet$ %.2f | приход$ %.2f | расход$ %.2f\ntrades %d | lot %.2f | pause %s\nПредикт обновляется каждый тик. Вход только по сигналу.",
               list, g_day_pnl, g_day_income, g_day_expense,
-              g_trades_today, InpLot, InpMinProfitMoney, InpBasketCutLoss, InpCutGraceSec,
+              g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
 //+------------------------------------------------------------------+
