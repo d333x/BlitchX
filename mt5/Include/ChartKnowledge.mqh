@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
-//|  v3: куда идёт РЫНОК СЕЙЧАС (M1/M5 импульс) + подтверждение M15   |
+//|  v3.81: ясный ход мягче — сильный M1 торгуем, M1f только veto     |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -95,10 +95,10 @@ MarketFlow ReadMarketFlow(const string sym)
 
    double atr_m1 = ATRPts(sym, PERIOD_M1, 14);
    double atr_m5 = ATRPts(sym, PERIOD_M5, 14);
-   // Порог: доля ATR — чтобы не ловить шум спреда
-   double thr_m1 = MathMax(atr_m1 * 0.35, 25.0);
-   double thr_m5 = MathMax(atr_m5 * 0.25, 40.0);
-   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.20, 50.0);
+   // Чуть мягче пороги — золото часто «шумное», но ход есть
+   double thr_m1 = MathMax(atr_m1 * 0.22, 18.0);
+   double thr_m5 = MathMax(atr_m5 * 0.18, 30.0);
+   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.15, 40.0);
 
    f.m1_pts = Pts(sym, CloseSlope(sym, PERIOD_M1, 8));
    f.m5_pts = Pts(sym, CloseSlope(sym, PERIOD_M5, 4));
@@ -106,11 +106,13 @@ MarketFlow ReadMarketFlow(const string sym)
    double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3)); // короткий импульс
 
    VoteSlope(f.m1_pts, thr_m1, f.buy_v, f.sell_v, f.reason, "M1");
-   VoteSlope(m1_fast, thr_m1 * 0.6, f.buy_v, f.sell_v, f.reason, "M1f");
+   VoteSlope(m1_fast, thr_m1 * 0.55, f.buy_v, f.sell_v, f.reason, "M1f");
    VoteSlope(f.m5_pts, thr_m5, f.buy_v, f.sell_v, f.reason, "M5");
    VoteSlope(m15_pts, thr_m15, f.buy_v, f.sell_v, f.reason, "M15");
 
-   // Цена vs EMA20 на M5 (живой)
+   bool above_ema = false;
+   bool below_ema = false;
+   // Цена vs EMA20 на M5 (живой) — мёртвая зона около EMA
    int ema = iMA(sym, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
    if(ema != INVALID_HANDLE)
      {
@@ -119,34 +121,61 @@ MarketFlow ReadMarketFlow(const string sym)
       if(CopyBuffer(ema, 0, 0, 2, e) >= 2)
         {
          double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-         if(bid > e[0]) { f.buy_v++; f.reason += "aboveEMA5 "; }
-         else           { f.sell_v++; f.reason += "belowEMA5 "; }
+         double dead = SymbolInfoDouble(sym, SYMBOL_POINT) * MathMax(thr_m1 * 0.15, 8.0);
+         if(bid > e[0] + dead) { f.buy_v++; above_ema = true; f.reason += "aboveEMA5 "; }
+         else if(bid < e[0] - dead) { f.sell_v++; below_ema = true; f.reason += "belowEMA5 "; }
+         else f.reason += "nearEMA5 ";
         }
       IndicatorRelease(ema);
      }
 
    // Формирующаяся M5 свеча
+   bool m5_up = false, m5_dn = false;
    double o[], c[];
    ArraySetAsSeries(o, true);
    ArraySetAsSeries(c, true);
    if(CopyOpen(sym, PERIOD_M5, 0, 1, o) >= 1 && CopyClose(sym, PERIOD_M5, 0, 1, c) >= 1)
      {
-      if(c[0] > o[0]) { f.buy_v++; f.reason += "M5now↑ "; }
-      else if(c[0] < o[0]) { f.sell_v++; f.reason += "M5now↓ "; }
+      if(c[0] > o[0]) { f.buy_v++; m5_up = true; f.reason += "M5now↑ "; }
+      else if(c[0] < o[0]) { f.sell_v++; m5_dn = true; f.reason += "M5now↓ "; }
      }
 
    f.reason += StringFormat("|M1=%.0f M5=%.0f thr1=%.0f", f.m1_pts, f.m5_pts, thr_m1);
 
-   // Чёткий сигнал: перевес голосов И короткий M1 в ту же сторону
-   if(f.buy_v >= f.sell_v + 2 && f.m1_pts > 0 && m1_fast >= 0)
+   // M1f veto только если ЯВНО против (мелкий отскок не блокирует)
+   const double veto = thr_m1 * 0.75;
+   const bool m1f_vs_buy  = (m1_fast <= -veto);
+   const bool m1f_vs_sell = (m1_fast >=  veto);
+   const bool m1_up = (f.m1_pts >= thr_m1 * 0.35);
+   const bool m1_dn = (f.m1_pts <= -thr_m1 * 0.35);
+   const bool strong_m1_up = (f.m1_pts >= thr_m1 * 1.2);
+   const bool strong_m1_dn = (f.m1_pts <= -thr_m1 * 1.2);
+
+   // Путь A: перевес голосов + M1 в ту же сторону
+   if(f.buy_v >= f.sell_v + 1 && m1_up && !m1f_vs_buy && f.buy_v >= 2)
      {
       f.dir = ORDER_TYPE_BUY;
-      f.clear = (f.buy_v >= 3);
+      f.clear = true;
+      f.reason = "FLOW " + f.reason;
      }
-   else if(f.sell_v >= f.buy_v + 2 && f.m1_pts < 0 && m1_fast <= 0)
+   else if(f.sell_v >= f.buy_v + 1 && m1_dn && !m1f_vs_sell && f.sell_v >= 2)
      {
       f.dir = ORDER_TYPE_SELL;
-      f.clear = (f.sell_v >= 3);
+      f.clear = true;
+      f.reason = "FLOW " + f.reason;
+     }
+   // Путь B: сильный M1 + EMA/M5now согласны (M15 может спорить — ок)
+   else if(strong_m1_up && !m1f_vs_buy && (above_ema || m5_up) && f.buy_v >= f.sell_v)
+     {
+      f.dir = ORDER_TYPE_BUY;
+      f.clear = true;
+      f.reason = "M1STRONG " + f.reason;
+     }
+   else if(strong_m1_dn && !m1f_vs_sell && (below_ema || m5_dn) && f.sell_v >= f.buy_v)
+     {
+      f.dir = ORDER_TYPE_SELL;
+      f.clear = true;
+      f.reason = "M1STRONG " + f.reason;
      }
    else
      {

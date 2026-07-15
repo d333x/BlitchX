@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.80 — живой импульс M1/M5: куда рынок идёт СЕЙЧАС              |
+  //|  v3.81 — быстрее вход: сильный M1 + мягкий clear-flow             |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.80"
-#property description "Следит за живым ходом цены (M1/M5). Без «вечного» BUY/SELL. Чоп → ждёт."
+#property version   "3.81"
+#property description "Живой ход M1/M5. Сильный импульс → вход. Полный чоп → ждёт."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -268,7 +268,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.80 FLOW | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
+   PrintFormat("ProfitScalper v3.81 FLOW | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
                _Symbol, InpLot, InpMinProfitMoney,
                InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss);
    return INIT_SUCCEEDED;
@@ -502,7 +502,7 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
          "ЖДЁМ ясный ход рынка: голоса BUY %d / SELL %d | M1=%.0fpts. Не торгуем шум.",
          flow.buy_v, flow.sell_v, flow.m1_pts);
       if(g_last_skip_ms[idx] == 0 ||
-         (GetTickCount64() - g_last_skip_ms[idx]) >= 5000)
+         (GetTickCount64() - g_last_skip_ms[idx]) >= 8000)
         {
          g_last_skip_ms[idx] = GetTickCount64();
          PrintFormat("WAIT %s | %s | %s", g_syms[idx], g_wait_why[idx], flow.reason);
@@ -908,7 +908,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.80 — куда идёт рынок СЕЙЧАС\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nЧоп/шум → ждём. Против потока → режем корзину.",
+              "ProfitScalper v3.81 — куда идёт рынок СЕЙЧАС\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nСильный M1 → вход. Только полный чоп → ждём.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
