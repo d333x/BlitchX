@@ -97,12 +97,21 @@ double ATRPts(const string sym, const ENUM_TIMEFRAMES tf, const int period = 14)
   }
 
 //+------------------------------------------------------------------+
-// Оценка потенциала хода в $ (tick model; fallback для XAU).
+// Оценка потенциала хода в $ (contract/tick model; XAU: move × 100 × lot).
 double EstimatePointsUsd(const string sym, const double pts, const double lot)
   {
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    if(point <= 0.0 || lot <= 0.0) return 0.0;
    double price_move = MathAbs(pts) * point;
+
+   // Самый точный путь для металлов/CFD: размер контракта
+   double contract = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+   if(contract > 0.0)
+     {
+      // XAU contract=100 → $1 хода × 100 × 0.05 lot = $5
+      return price_move * contract * lot;
+     }
+
    double tick_size = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
    double tick_value = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
    if(tick_size > 0.0 && tick_value > 0.0)
@@ -110,7 +119,6 @@ double EstimatePointsUsd(const string sym, const double pts, const double lot)
 
    string u = sym;
    StringToUpper(u);
-   // XAU: ≈ $1 хода × $100 / 1.00 lot → на 0.05 = $5 за $1
    if(StringFind(u, "XAU") >= 0 || StringFind(u, "GOLD") >= 0)
       return price_move * 100.0 * lot;
    return price_move * 100000.0 * lot;
@@ -294,11 +302,10 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
    const bool m1_up = (m1_fast >= thr_m1 * 0.25 || (f.m1_pts >= thr_m1 * 0.20 && m1_fast >= 0));
    const bool m1_dn = (m1_fast <= -thr_m1 * 0.25 || (f.m1_pts <= -thr_m1 * 0.20 && m1_fast <= 0));
 
-   // Expectancy: потенциал хода ≈ 0.85 * ATR(M5) в деньгах (реалистичная цель скальпа)
-   // + буст если H1 ATR расширен (трендовый день)
-   double atr_use = atr_m5 * 0.85 + atr_m15 * 0.25;
-   if(atr_h1 > atr_m15 * 2.5)
-      atr_use *= 1.15; // волатильный день
+   // Expectancy: потенциал ≈ ATR(M5)+часть M15 в деньгах (цель скальпа по тренду)
+   double atr_use = atr_m5 * 1.0 + atr_m15 * 0.35;
+   if(atr_h1 > atr_m15 * 2.2)
+      atr_use *= 1.20; // расширенная волатильность дня
    f.expected_usd = EstimatePointsUsd(sym, atr_use, lot_for_expect);
 
    // Align score (Elder Triple Screen idea: HTF + LTF)
@@ -335,6 +342,8 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
       f.opportunity = OPP_BIG;
    else if(f.aligned && money_mid && conf_mid && f.align_score >= 4)
       f.opportunity = OPP_BIG; // полное выравнивание = тоже BIG
+   else if(f.align_score >= 5 && f.conf >= min_enter_conf * 0.90 && money_mid)
+      f.opportunity = OPP_BIG; // 5/5 ТФ + деньги ≥ mid → институциональный confluence
    else if(money_mid && conf_mid && f.align_score >= 3)
       f.opportunity = OPP_MID;
    else
