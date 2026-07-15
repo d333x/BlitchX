@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
- //|  v3.94: мгновенный сигнал BUY/SELL/WAIT + веса ТФ + уверенность  |
+//|  v3.95: фильтр BIG MOVE — вход только когда реально есть $ ход   |
+//|  База: Triple Screen (Elder), MTF confluence, expectancy (Tharp)  |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -10,6 +11,13 @@ enum ENUM_MARKET_SIGNAL
    SIG_WAIT = 0,
    SIG_BUY  = 1,
    SIG_SELL = 2
+  };
+
+enum ENUM_OPP_SIZE
+  {
+   OPP_SMALL = 0,   // шум / мелкий ход — НЕ торгуем
+   OPP_MID   = 1,   // средний — только если allow_mid
+   OPP_BIG   = 2    // крупный — наша цель
   };
 
 struct KnowledgeScore
@@ -26,15 +34,19 @@ struct MarketFlow
    double m1_pts;
    double m5_pts;
    bool   clear;                 // можно входить
-   ENUM_ORDER_TYPE dir;          // текущий bias (всегда есть)
+   ENUM_ORDER_TYPE dir;
    string reason;
-   // v3.94
-   ENUM_MARKET_SIGNAL signal;    // WAIT / BUY / SELL для панели
-   double buy_w;                 // взвешенный buy
-   double sell_w;                // взвешенный sell
-   double conf;                  // 0..100 уверенность
-   string signal_txt;            // "СИГНАЛ: BUY 78%" и т.п.
-   string analysis;              // краткий разбор ТФ
+   ENUM_MARKET_SIGNAL signal;
+   double buy_w;
+   double sell_w;
+   double conf;                  // 0..100
+   string signal_txt;
+   string analysis;
+   // v3.95
+   ENUM_OPP_SIZE opportunity;    // SMALL / MID / BIG
+   double expected_usd;          // оценка хода в $ на текущий lot
+   bool   aligned;               // все ТФ в одну сторону
+   int    align_score;           // сколько ТФ за направление (0..5)
   };
 
 //+------------------------------------------------------------------+
@@ -82,6 +94,26 @@ double ATRPts(const string sym, const ENUM_TIMEFRAMES tf, const int period = 14)
       v = Pts(sym, a[0]);
    IndicatorRelease(h);
    return MathMax(v, 10.0);
+  }
+
+//+------------------------------------------------------------------+
+// Оценка потенциала хода в $ (tick model; fallback для XAU).
+double EstimatePointsUsd(const string sym, const double pts, const double lot)
+  {
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(point <= 0.0 || lot <= 0.0) return 0.0;
+   double price_move = MathAbs(pts) * point;
+   double tick_size = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   if(tick_size > 0.0 && tick_value > 0.0)
+      return (price_move / tick_size) * tick_value * lot;
+
+   string u = sym;
+   StringToUpper(u);
+   // XAU: ≈ $1 хода × $100 / 1.00 lot → на 0.05 = $5 за $1
+   if(StringFind(u, "XAU") >= 0 || StringFind(u, "GOLD") >= 0)
+      return price_move * 100.0 * lot;
+   return price_move * 100000.0 * lot;
   }
 
 //+------------------------------------------------------------------+
@@ -140,8 +172,10 @@ int SlopeDir(const double slope_pts, const double thr)
   }
 
 //+------------------------------------------------------------------+
-// Мгновенный предикт: bias всегда есть; clear = вход разрешён.
-MarketFlow ReadMarketFlow(const string sym)
+// Мгновенный предикт: bias всегда; clear = только BIG (или MID если разрешён снаружи).
+MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
+                          const double min_big_usd,
+                          const double min_enter_conf)
   {
    MarketFlow f;
    f.buy_v = 0; f.sell_v = 0;
@@ -154,6 +188,10 @@ MarketFlow ReadMarketFlow(const string sym)
    f.conf = 0;
    f.signal_txt = "СИГНАЛ: ЖДЁМ";
    f.analysis = "";
+   f.opportunity = OPP_SMALL;
+   f.expected_usd = 0;
+   f.aligned = false;
+   f.align_score = 0;
 
    double atr_m1 = ATRPts(sym, PERIOD_M1, 14);
    double atr_m5 = ATRPts(sym, PERIOD_M5, 14);
@@ -212,7 +250,6 @@ MarketFlow ReadMarketFlow(const string sym)
       IndicatorRelease(ema);
      }
 
-   // M1 fast impulse — тайминг
    if(m1_fast >= thr_m1 * 0.45)
      { f.reason += "M1f↑ "; f.buy_w += 0.8; }
    else if(m1_fast <= -thr_m1 * 0.45)
@@ -220,7 +257,6 @@ MarketFlow ReadMarketFlow(const string sym)
 
    f.reason += StringFormat("|M1=%.0f M5=%.0f M15=%.0f H1=%.0f", f.m1_pts, f.m5_pts, m15_pts, h1_pts);
 
-   // Bias сразу (даже в шуме)
    if(f.buy_w > f.sell_w + 0.15)
       f.dir = ORDER_TYPE_BUY;
    else if(f.sell_w > f.buy_w + 0.15)
@@ -234,9 +270,8 @@ MarketFlow ReadMarketFlow(const string sym)
    else
       f.conf = 100.0 * MathAbs(f.buy_w - f.sell_w) / total_w;
 
-   // Условия входа
-   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.15 && m1_fast >= -thr_m1 * 0.50);
-   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.15 && m1_fast <= thr_m1 * 0.50);
+   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.15 && m1_fast >= -thr_m1 * 0.35);
+   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.15 && m1_fast <= thr_m1 * 0.35);
 
    const bool struct_buy =
       (h1_cl > 0 || h1_pts >= thr_h1 * 0.28 || h1_now > 0) &&
@@ -250,7 +285,6 @@ MarketFlow ReadMarketFlow(const string sym)
    const bool wick_blocks_buy  = (h1_now < 0 && h1_cl <= 0);
    const bool wick_blocks_sell = (h1_now > 0 && h1_cl >= 0);
 
-   // Разбор для панели (сразу)
    const bool h1_up = (h1_cl > 0 || (h1_now > 0 && h1_cl >= 0));
    const bool h1_dn = (h1_cl < 0 || (h1_now < 0 && h1_cl <= 0));
    const bool m15_up = (m15_now > 0 || (m15_pts >= thr_m15 * 0.20 && m15_now >= 0));
@@ -260,37 +294,81 @@ MarketFlow ReadMarketFlow(const string sym)
    const bool m1_up = (m1_fast >= thr_m1 * 0.25 || (f.m1_pts >= thr_m1 * 0.20 && m1_fast >= 0));
    const bool m1_dn = (m1_fast <= -thr_m1 * 0.25 || (f.m1_pts <= -thr_m1 * 0.20 && m1_fast <= 0));
 
+   // Expectancy: потенциал хода ≈ 0.85 * ATR(M5) в деньгах (реалистичная цель скальпа)
+   // + буст если H1 ATR расширен (трендовый день)
+   double atr_use = atr_m5 * 0.85 + atr_m15 * 0.25;
+   if(atr_h1 > atr_m15 * 2.5)
+      atr_use *= 1.15; // волатильный день
+   f.expected_usd = EstimatePointsUsd(sym, atr_use, lot_for_expect);
+
+   // Align score (Elder Triple Screen idea: HTF + LTF)
+   if(f.dir == ORDER_TYPE_BUY)
+     {
+      if(h1_up) f.align_score++;
+      if(m15_up) f.align_score++;
+      if(m5_up) f.align_score++;
+      if(m1_up) f.align_score++;
+      if(above_ema) f.align_score++;
+     }
+   else
+     {
+      if(h1_dn) f.align_score++;
+      if(m15_dn) f.align_score++;
+      if(m5_dn) f.align_score++;
+      if(m1_dn) f.align_score++;
+      if(below_ema) f.align_score++;
+     }
+
+   const bool aligned_buy  = h1_up && m15_up && m5_up && m1_up && above_ema && !wick_blocks_buy;
+   const bool aligned_sell = h1_dn && m15_dn && m5_dn && m1_dn && below_ema && !wick_blocks_sell;
+   f.aligned = (aligned_buy || aligned_sell);
+
+   // Классификация возможности: SMALL / MID / BIG
+   // BIG = большой $ потенциал + сильный consensus + выравнивание ТФ
+   const bool money_big = (f.expected_usd >= min_big_usd);
+   const bool money_mid = (f.expected_usd >= min_big_usd * 0.55);
+   const bool conf_big  = (f.conf >= min_enter_conf);
+   const bool conf_mid  = (f.conf >= min_enter_conf * 0.85);
+   const bool weight_gap = MathAbs(f.buy_w - f.sell_w) >= 4.0;
+
+   if(money_big && conf_big && f.align_score >= 4 && weight_gap)
+      f.opportunity = OPP_BIG;
+   else if(f.aligned && money_mid && conf_mid && f.align_score >= 4)
+      f.opportunity = OPP_BIG; // полное выравнивание = тоже BIG
+   else if(money_mid && conf_mid && f.align_score >= 3)
+      f.opportunity = OPP_MID;
+   else
+      f.opportunity = OPP_SMALL;
+
+   string opp_tag = (f.opportunity == OPP_BIG ? "КРУПНЫЙ"
+                     : (f.opportunity == OPP_MID ? "СРЕДНИЙ" : "МЕЛКИЙ"));
+
    f.analysis = StringFormat(
-      "H1:%s M15:%s M5:%s M1:%s EMA5:%s | вес BUY %.1f / SELL %.1f",
+      "H1:%s M15:%s M5:%s M1:%s EMA5:%s | вес BUY %.1f / SELL %.1f | %s ~$%.0f align=%d",
       h1_up ? "↑" : (h1_dn ? "↓" : "="),
       m15_up ? "↑" : (m15_dn ? "↓" : "="),
       m5_up ? "↑" : (m5_dn ? "↓" : "="),
       m1_up ? "↑" : (m1_dn ? "↓" : "="),
       above_ema ? "выше" : (below_ema ? "ниже" : "около"),
-      f.buy_w, f.sell_w);
+      f.buy_w, f.sell_w, opp_tag, f.expected_usd, f.align_score);
 
-   bool enter_buy =
-      struct_buy && m1_with_buy && !wick_blocks_buy &&
-      f.buy_w > f.sell_w + 0.8 && f.conf >= 32.0 && f.buy_v >= 3;
-   bool enter_sell =
-      struct_sell && m1_with_sell && !wick_blocks_sell &&
-      f.sell_w > f.buy_w + 0.8 && f.conf >= 32.0 && f.sell_v >= 3;
+   // Вход ТОЛЬКО в BIG. Без soft-entry по conf 50% — именно он давал −$12 на мелких сетах.
+   bool enter_buy = false;
+   bool enter_sell = false;
 
-   // Все ТФ в одну сторону — работаем по сигналу сразу
-   const bool aligned_buy  = h1_up && m15_up && m5_up && m1_up && above_ema && !wick_blocks_buy;
-   const bool aligned_sell = h1_dn && m15_dn && m5_dn && m1_dn && below_ema && !wick_blocks_sell;
-   if(aligned_buy && f.buy_w >= f.sell_w)
-     { enter_buy = true; f.conf = MathMax(f.conf, 60.0); }
-   if(aligned_sell && f.sell_w >= f.buy_w)
-     { enter_sell = true; f.conf = MathMax(f.conf, 60.0); }
-
-   // Сильный bias без идеального M1 — мягкий вход
-   if(!enter_buy && !enter_sell && f.conf >= 50.0)
+   if(f.opportunity == OPP_BIG)
      {
-      if(f.dir == ORDER_TYPE_BUY && struct_buy && !wick_blocks_buy && m1_fast >= -thr_m1 * 0.8)
+      if(f.dir == ORDER_TYPE_BUY && struct_buy && m1_with_buy && !wick_blocks_buy &&
+         f.buy_w > f.sell_w + 1.2 && f.align_score >= 4)
          enter_buy = true;
-      if(f.dir == ORDER_TYPE_SELL && struct_sell && !wick_blocks_sell && m1_fast <= thr_m1 * 0.8)
+      if(f.dir == ORDER_TYPE_SELL && struct_sell && m1_with_sell && !wick_blocks_sell &&
+         f.sell_w > f.buy_w + 1.2 && f.align_score >= 4)
          enter_sell = true;
+      // Полное выравнивание всех ТФ — разрешаем даже если M1 чуть шумит
+      if(aligned_buy && f.buy_w >= f.sell_w)
+        { enter_buy = true; f.conf = MathMax(f.conf, min_enter_conf); }
+      if(aligned_sell && f.sell_w >= f.buy_w)
+        { enter_sell = true; f.conf = MathMax(f.conf, min_enter_conf); }
      }
 
    if(enter_buy)
@@ -298,29 +376,38 @@ MarketFlow ReadMarketFlow(const string sym)
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
       f.signal = SIG_BUY;
-      f.reason = "QUALITY " + f.reason;
-      f.signal_txt = StringFormat("СИГНАЛ: BUY %.0f%%  → ВХОД", f.conf);
+      f.reason = "BIG " + f.reason;
+      f.signal_txt = StringFormat("СИГНАЛ: BUY %.0f%% КРУПНЫЙ ~$%.0f → ВХОД", f.conf, f.expected_usd);
      }
    else if(enter_sell)
      {
       f.dir = ORDER_TYPE_SELL;
       f.clear = true;
       f.signal = SIG_SELL;
-      f.reason = "QUALITY " + f.reason;
-      f.signal_txt = StringFormat("СИГНАЛ: SELL %.0f%%  → ВХОД", f.conf);
+      f.reason = "BIG " + f.reason;
+      f.signal_txt = StringFormat("СИГНАЛ: SELL %.0f%% КРУПНЫЙ ~$%.0f → ВХОД", f.conf, f.expected_usd);
      }
    else
      {
       f.clear = false;
       f.signal = SIG_WAIT;
       string bias = (f.dir == ORDER_TYPE_BUY ? "BUY" : "SELL");
-      f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ (bias %s %.0f%%)", bias, f.conf);
-      f.reason = "CHOP " + f.reason;
-      if(!m1_with_buy && !m1_with_sell)
-         f.reason = "WAIT_M1 " + f.reason;
+      if(f.opportunity == OPP_SMALL)
+         f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ МЕЛКИЙ (bias %s %.0f%% ~$%.0f)", bias, f.conf, f.expected_usd);
+      else if(f.opportunity == OPP_MID)
+         f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ СРЕДНИЙ (bias %s %.0f%% ~$%.0f)", bias, f.conf, f.expected_usd);
+      else
+         f.signal_txt = StringFormat("СИГНАЛ: ЖДЁМ КРУПНЫЙ не готов (bias %s %.0f%% ~$%.0f)", bias, f.conf, f.expected_usd);
+      f.reason = "FILTER_" + opp_tag + " " + f.reason;
      }
 
    return f;
+  }
+
+// Backward-compatible overload
+MarketFlow ReadMarketFlow(const string sym)
+  {
+   return ReadMarketFlow(sym, 0.05, 8.0, 72.0);
   }
 
 //+------------------------------------------------------------------+
@@ -331,7 +418,6 @@ KnowledgeScore EvaluateKnowledge(const string sym,
   {
    MarketFlow f = ReadMarketFlow(sym);
    KnowledgeScore s;
-   // Баллы из весов — для панели BUY vs SELL
    s.buy  = f.buy_w * 10.0 + MathMax(0.0, f.m1_pts) / 25.0;
    s.sell = f.sell_w * 10.0 + MathMax(0.0, -f.m1_pts) / 25.0;
    s.reason = f.signal_txt + " | " + f.analysis + " | " + f.reason;

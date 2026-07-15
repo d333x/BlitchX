@@ -1,10 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.94 — мгновенный СИГНАЛ на графике, торговля строго по нему      |
+//|  v3.95 — только КРУПНЫЙ ход; R:R так, чтобы 1 лосс ≠ 6 локов     |
+//|  Expectancy (Tharp) + MTF confluence (Elder) + фильтр SMALL/BIG  |
 //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.94"
-#property description "Сигнал BUY/SELL сразу. Анализ ТФ с %. Вход только по сигналу."
+#property version   "3.95"
+#property description "Вход только в КРУПНЫЙ сетап. Лок крупный, cut меньше лока."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -23,10 +24,10 @@ input int                  InpMagic     = 26071470;
 input int                  InpDeviation = 30;
 input int                  InpMaxPositions = 1;
 input int                  InpBasketOpen = 1;
-input int                  InpMaxTradesDay = 300;
+input int                  InpMaxTradesDay = 120;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 12000;
-input int                  InpLossCooldownMs = 60000;
+input int                  InpFarmCooldownMs = 25000;  // реже долбим после лока
+input int                  InpLossCooldownMs = 180000; // 3 мин после −$ : не мстим рынку
 input bool                 InpRefillBasket = false;
 
 input group "=== Символ ==="
@@ -36,12 +37,14 @@ input string               InpAlsoSymbols = "";
 input group "=== Предикт прибыли (СУММА $) ==="
 input bool                 InpUseKnowledge = true;
 input bool                 InpSmartBigProfit = true;
-input double               InpMinProfitMoney = 1.80;   // Быстрее фиксируем плюс
-input double               InpBigProfitMoney = 4.00;
-input double               InpArmLockMoney = 1.00;     // Пик→закрытие отката
+input bool                 InpOnlyBigOpportunity = true; // НЕ торгуем МЕЛКИЙ/СРЕДНИЙ
+input double               InpMinEnterConf = 72.0;       // порог уверенности для BIG
+input double               InpMinProfitMoney = 8.00;    // цель лока (не крошки $1–2)
+input double               InpBigProfitMoney = 12.00;   // сильный BIG — держим дольше
+input double               InpArmLockMoney = 6.00;      // peak-lock только после реального плюса
 input double               InpStrongScoreGap = 8.0;
-input double               InpStrongRR = 2.0;
-input double               InpWeakRR = 1.2;
+input double               InpStrongRR = 2.5;           // TP дальше cut — expectancy > 0
+input double               InpWeakRR = 1.5;
 input bool                 InpCloseOnProfit  = true;
 input bool                 InpCloseEachAlone = true;
 input int                  InpLockTimerMs    = 100;
@@ -58,7 +61,7 @@ input ENUM_TIMEFRAMES      InpSignalTF  = PERIOD_M15;
 input int                  InpFastEMA   = 20;
 input int                  InpSlowEMA   = 50;
 input int                  InpATRPeriod = 14;
-input double               InpATR_SL_Mult = 1.4;       // SL шире шума — брокер не выбьет раньше grace
+input double               InpATR_SL_Mult = 1.2;       // SL ближе к риску cut (R:R)
 input bool                 InpUseSpreadFilter = true;
 input int                  InpMaxSpreadPts = 400;
 
@@ -67,17 +70,17 @@ input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
 input bool                 InpRequireClearFlow = true;
 input bool                 InpCloseAgainstFlow = false;
-input double               InpBasketCutLoss = 6.00;    // После grace; шум ~$3 на 0.05 — не режем
-input int                  InpCutGraceSec = 60;        // Не резать первые N сек (иначе «профита нет»)
-input double               InpPanicCutMoney = 12.00;   // Даже в grace: авария
+input double               InpBasketCutLoss = 4.00;    // 1 cut < 1 lock ($8)
+input int                  InpCutGraceSec = 45;
+input double               InpPanicCutMoney = 5.00;    // было $12 = 6 локов по $2; теперь ≤ 1 лока
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
-input double               InpMaxLossMoney = 60.0;
+input double               InpMaxLossMoney = 40.0;
 input bool                 InpMaxLossPct = false;
 input double               InpMaxLossPercent = 5.0;
 input bool                 InpPauseIfExpenseLeads = true;
-input double               InpExpenseLeadBuffer = 12.0; // Пауза новых входов только при сильном перекосе
+input double               InpExpenseLeadBuffer = 8.0;
 
 #define MAX_SYMS 8
 
@@ -106,6 +109,9 @@ string g_signal_txt[MAX_SYMS];
 string g_analysis[MAX_SYMS];
 double g_conf[MAX_SYMS];
 bool   g_signal_enter[MAX_SYMS];
+double g_expected_usd[MAX_SYMS];
+int    g_opp_size[MAX_SYMS];       // OPP_SMALL/MID/BIG
+int    g_align_score[MAX_SYMS];
 ulong  g_last_pulse_ms = 0;
 ulong  g_last_signal_print_ms = 0;
 
@@ -272,6 +278,9 @@ int OnInit()
       g_analysis[i] = "-";
       g_conf[i] = 0;
       g_signal_enter[i] = false;
+      g_expected_usd[i] = 0;
+      g_opp_size[i] = OPP_SMALL;
+      g_align_score[i] = 0;
       if(g_ema_fast[i] == INVALID_HANDLE || g_ema_slow[i] == INVALID_HANDLE || g_atr[i] == INVALID_HANDLE)
         {
          PrintFormat("Индикаторы не созданы для %s", g_syms[i]);
@@ -292,8 +301,10 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.94 SIGNAL | chart=%s | lot=%.2f | lock$=%.2f | cut=$%.2f grace=%ds",
-               _Symbol, InpLot, InpMinProfitMoney, InpBasketCutLoss, InpCutGraceSec);
+   PrintFormat("ProfitScalper v3.95 BIG | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f cut=$%.2f grace=%ds | onlyBIG=%s conf>=%.0f",
+               _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney,
+               InpPanicCutMoney, InpBasketCutLoss, InpCutGraceSec,
+               InpOnlyBigOpportunity ? "YES" : "no", InpMinEnterConf);
    g_last_pulse_ms = 0;
    g_last_signal_print_ms = 0;
    RefreshAllSignals();
@@ -318,6 +329,12 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
+MarketFlow FlowFor(const string sym)
+  {
+   return ReadMarketFlow(sym, InpLot, InpMinProfitMoney, InpMinEnterConf);
+  }
+
+//+------------------------------------------------------------------+
 void PulseAlive()
   {
    if(g_sym_count <= 0) return;
@@ -327,14 +344,17 @@ void PulseAlive()
    g_last_pulse_ms = GetTickCount64();
 
    const string sym = g_syms[0];
-   MarketFlow flow = ReadMarketFlow(sym);
+   MarketFlow flow = FlowFor(sym);
    int open_n = CountOurPositions(sym);
+   string opp = (flow.opportunity == OPP_BIG ? "КРУПНЫЙ"
+                 : (flow.opportunity == OPP_MID ? "СРЕДНИЙ" : "МЕЛКИЙ"));
    PrintFormat(
-      "PULSE %s | %s conf=%.0f enter=%s B%d/S%d open=%d | net$=%.2f приход$=%.2f расход$=%.2f | %s | %s",
+      "PULSE %s | %s conf=%.0f enter=%s opp=%s expect$=%.0f align=%d B%d/S%d open=%d | net$=%.2f приход$=%.2f расход$=%.2f | %s | %s",
       sym,
       flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
       flow.conf,
       flow.clear ? "YES" : "no",
+      opp, flow.expected_usd, flow.align_score,
       flow.buy_v, flow.sell_v, open_n,
       g_day_pnl, g_day_income, g_day_expense,
       flow.signal_txt,
@@ -348,7 +368,7 @@ void RefreshAllSignals()
    for(int idx = 0; idx < g_sym_count; idx++)
      {
       const string sym = g_syms[idx];
-      MarketFlow flow = ReadMarketFlow(sym);
+      MarketFlow flow = FlowFor(sym);
       KnowledgeScore ks = EvaluateKnowledge(sym, InpSignalTF, true, false);
 
       g_score_buy[idx] = ks.buy;
@@ -358,20 +378,27 @@ void RefreshAllSignals()
       g_conf[idx] = flow.conf;
       g_signal_txt[idx] = flow.signal_txt;
       g_analysis[idx] = flow.analysis;
-      g_signal_enter[idx] = flow.clear;
+      g_expected_usd[idx] = flow.expected_usd;
+      g_opp_size[idx] = (int)flow.opportunity;
+      g_align_score[idx] = flow.align_score;
+
+      // Вход только если clear (BIG) — и опционально жёстко onlyBIG
+      bool allow = flow.clear;
+      if(InpOnlyBigOpportunity && flow.opportunity != OPP_BIG)
+         allow = false;
+      g_signal_enter[idx] = allow;
       g_pred_side[idx] = (flow.dir == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
-      g_pred_strong[idx] = (InpSmartBigProfit && flow.clear && flow.conf >= 55.0);
+      g_pred_strong[idx] = (InpSmartBigProfit && allow && flow.conf >= InpMinEnterConf);
       g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
 
-      if(flow.clear)
+      if(allow)
          g_wait_why[idx] = "";
       else
          g_wait_why[idx] = StringFormat(
-            "Ждём вход: bias %s conf=%.0f%% | %s",
+            "Ждём КРУПНЫЙ: bias %s conf=%.0f%% expect$=%.0f align=%d | %s",
             flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
-            flow.conf, flow.analysis);
+            flow.conf, flow.expected_usd, flow.align_score, flow.analysis);
 
-      // Печать смены сигнала не чаще 3 сек
       if(g_last_signal_print_ms == 0 ||
          (GetTickCount64() - g_last_signal_print_ms) >= 3000)
         {
@@ -500,9 +527,23 @@ void FarmSymbol(const int idx)
      }
 
    ENUM_ORDER_TYPE type = (g_pred_side[idx] == "DOWN/SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   string reason = StringFormat("%s | work-by-signal conf=%.0f lock$=%.2f | %s",
-                                g_signal_txt[idx], g_conf[idx], g_lock_target[idx], g_analysis[idx]);
+   string reason = StringFormat("%s | BIG-only conf=%.0f expect$=%.0f lock$=%.2f align=%d | %s",
+                                g_signal_txt[idx], g_conf[idx], g_expected_usd[idx],
+                                g_lock_target[idx], g_align_score[idx], g_analysis[idx]);
    bool can_trade = g_signal_enter[idx];
+
+   // Доп. фильтр expectancy: не входим, если ожидаемый ход < цели лока
+   if(can_trade && g_expected_usd[idx] < InpMinProfitMoney * 0.90)
+     {
+      can_trade = false;
+      if(g_last_skip_ms[idx] == 0 ||
+         (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
+        {
+         g_last_skip_ms[idx] = GetTickCount64();
+         PrintFormat("SKIP small-expect %s: expect$=%.0f < lock$=%.2f",
+                     sym, g_expected_usd[idx], InpMinProfitMoney);
+        }
+     }
 
    if(InpDirection == DIR_BUY)
      { type = ORDER_TYPE_BUY; can_trade = true; reason = "fixed BUY"; }
@@ -641,7 +682,7 @@ bool AnalyzeSymbol(const int idx, MarketScore &s)
    else
      {
       // Тренд для panel — по живому flow, без блокировки входа
-      MarketFlow fl = ReadMarketFlow(sym);
+      MarketFlow fl = FlowFor(sym);
       s.trend_up = (fl.dir == ORDER_TYPE_BUY);
       s.trend_down = (fl.dir == ORDER_TYPE_SELL);
      }
@@ -694,8 +735,8 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
       return true;
      }
 
-   // Свежий анализ — торговля только по сигналу
-   MarketFlow flow = ReadMarketFlow(g_syms[idx]);
+   // Свежий анализ — торговля только по КРУПНОМУ сигналу
+   MarketFlow flow = FlowFor(g_syms[idx]);
    KnowledgeScore ks = EvaluateKnowledge(g_syms[idx], InpSignalTF, s.trend_up, s.trend_down);
    g_score_buy[idx] = ks.buy;
    g_score_sell[idx] = ks.sell;
@@ -704,31 +745,39 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
    g_conf[idx] = flow.conf;
    g_signal_txt[idx] = flow.signal_txt;
    g_analysis[idx] = flow.analysis;
-   g_signal_enter[idx] = flow.clear;
+   g_expected_usd[idx] = flow.expected_usd;
+   g_opp_size[idx] = (int)flow.opportunity;
+   g_align_score[idx] = flow.align_score;
+   bool allow = flow.clear;
+   if(InpOnlyBigOpportunity && flow.opportunity != OPP_BIG)
+      allow = false;
+   if(allow && flow.expected_usd < InpMinProfitMoney * 0.90)
+      allow = false;
+   g_signal_enter[idx] = allow;
    type = flow.dir;
    g_pred_side[idx] = (type == ORDER_TYPE_BUY ? "UP/BUY" : "DOWN/SELL");
 
-   if(InpRequireClearFlow && !flow.clear)
+   if(InpRequireClearFlow && !allow)
      {
       g_pred_strong[idx] = false;
       g_lock_target[idx] = InpMinProfitMoney;
       g_wait_why[idx] = StringFormat(
-         "Сигнал ещё не готов к входу (bias %s %.0f%%). %s",
-         type == ORDER_TYPE_BUY ? "BUY" : "SELL", flow.conf, flow.analysis);
+         "Ждём КРУПНЫЙ (bias %s %.0f%% ~$%.0f align=%d). %s",
+         type == ORDER_TYPE_BUY ? "BUY" : "SELL", flow.conf,
+         flow.expected_usd, flow.align_score, flow.analysis);
       reason = "WAIT " + flow.signal_txt + " | " + flow.reason;
       return false;
      }
 
-   g_pred_strong[idx] = (InpSmartBigProfit && flow.clear && flow.conf >= 55.0);
+   g_pred_strong[idx] = (InpSmartBigProfit && allow && flow.conf >= InpMinEnterConf);
    g_lock_target[idx] = g_pred_strong[idx] ? InpBigProfitMoney : InpMinProfitMoney;
    g_wait_why[idx] = "";
-   reason = StringFormat("%s | FLOW %s conf=%.0f B%d/S%d w%.1f/%.1f lock$=%.2f%s | %s",
+   reason = StringFormat("%s | BIG %s conf=%.0f expect$=%.0f B%d/S%d w%.1f/%.1f lock$=%.2f | %s",
                          flow.signal_txt,
                          type == ORDER_TYPE_BUY ? "BUY" : "SELL",
-                         flow.conf, flow.buy_v, flow.sell_v,
+                         flow.conf, flow.expected_usd, flow.buy_v, flow.sell_v,
                          flow.buy_w, flow.sell_w,
                          g_lock_target[idx],
-                         g_pred_strong[idx] ? " BIG" : "",
                          flow.analysis);
    return true;
   }
@@ -837,7 +886,7 @@ void ProtectAgainstFlow(const int idx)
    if(our < 0)
       return;
 
-   MarketFlow flow = ReadMarketFlow(sym);
+   MarketFlow flow = FlowFor(sym);
    bool closed_h1_vs =
       (our == POSITION_TYPE_BUY  && StringFind(flow.reason, "H1cl↓") >= 0) ||
       (our == POSITION_TYPE_SELL && StringFind(flow.reason, "H1cl↑") >= 0);
@@ -1007,7 +1056,7 @@ void ManageOne(const ulong ticket)
    if(money > g_peak_money[idx])
       g_peak_money[idx] = money;
 
-   // Цель достигнута
+   // Цель достигнута — полный lock
    if(InpCloseOnProfit && InpCloseEachAlone && money >= lock_at)
      {
       if(trade.PositionClose(ticket, InpDeviation))
@@ -1024,15 +1073,18 @@ void ManageOne(const ulong ticket)
       return;
      }
 
-   // Уже был плюс >= arm — закрываем откат, пока не съели в минус
-   if(InpCloseOnProfit && g_peak_money[idx] >= InpArmLockMoney &&
-      money >= MathMax(0.80, InpArmLockMoney * 0.75) &&
-      money <= g_peak_money[idx] - 0.40)
+   // Peak-lock: только после РЕАЛЬНОГО плюса (arm), и не отдаём крошки.
+   // Раньше arm=$1 → +$1.2 локали, а panic −$12 съедал 6 таких.
+   double arm = MathMax(InpArmLockMoney, lock_at * 0.55);
+   double min_keep = MathMax(arm * 0.85, InpMinProfitMoney * 0.50);
+   if(InpCloseOnProfit && g_peak_money[idx] >= arm &&
+      money >= min_keep &&
+      money <= g_peak_money[idx] - MathMax(0.80, arm * 0.12))
      {
       if(trade.PositionClose(ticket, InpDeviation))
         {
-         PrintFormat("LOCK PEAK %s #%I64u +%.2f (peak=%.2f arm=%.2f)",
-                     sym, ticket, money, g_peak_money[idx], InpArmLockMoney);
+         PrintFormat("LOCK PEAK %s #%I64u +%.2f (peak=%.2f arm=%.2f keep>=%.2f)",
+                     sym, ticket, money, g_peak_money[idx], arm, min_keep);
          g_peak_money[idx] = 0.0;
          for(int i = 0; i < g_sym_count; i++)
             if(g_syms[i] == sym)
@@ -1187,9 +1239,10 @@ void UpdatePanel()
                  action);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.94 SIGNAL\n%s\n————\nnet$ %.2f | приход$ %.2f | расход$ %.2f\ntrades %d | lot %.2f | pause %s\nПредикт обновляется каждый тик. Вход только по сигналу.",
+              "ProfitScalper v3.95 BIG\n%s\n————\nnet$ %.2f | приход$ %.2f | расход$ %.2f\ntrades %d | lot %.2f | pause %s\nТолько КРУПНЫЙ. lock$%.0f panic$%.0f (1 cut < 1 lock).",
               list, g_day_pnl, g_day_income, g_day_expense,
               g_trades_today, InpLot,
-              g_trading_paused ? "YES" : "no"));
+              g_trading_paused ? "YES" : "no",
+              InpMinProfitMoney, InpPanicCutMoney));
   }
 //+------------------------------------------------------------------+
