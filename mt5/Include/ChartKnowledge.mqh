@@ -158,25 +158,32 @@ MarketFlow ReadMarketFlow(const string sym)
 
    f.reason += StringFormat("|M1=%.0f M5=%.0f M15=%.0f H1=%.0f", f.m1_pts, f.m5_pts, m15_pts, h1_pts);
 
-   // Жёсткие запреты: не покупать в красные свечи / не продавать в зелёные
-   const bool candle_blocks_buy =
-      (h1_now < 0) || (m5_now < 0 && m15_now < 0) ||
-      (m15_pts <= -thr_m15 && f.m5_pts <= 0) ||
-      (h1_pts <= -thr_h1 * 0.5);
-   const bool candle_blocks_sell =
-      (h1_now > 0) || (m5_now > 0 && m15_now > 0) ||
-      (m15_pts >= thr_m15 && f.m5_pts >= 0) ||
-      (h1_pts >= thr_h1 * 0.5);
+   // Жёсткий запрет только против H1 (то что на графике у глаза)
+   const bool candle_blocks_buy  = (h1_now < 0);
+   const bool candle_blocks_sell = (h1_now > 0);
 
-   // BUY: перевес + M1 не против + свечи не красные
-   const bool m1_ok_buy  = (f.m1_pts >= -thr_m1 * 0.35);
-   const bool m1_ok_sell = (f.m1_pts <=  thr_m1 * 0.35);
-   // Если все видимые свечи в одну сторону — M1-отскок не стопит
+   const bool m1_ok_buy  = (f.m1_pts >= -thr_m1 * 0.5);
+   const bool m1_ok_sell = (f.m1_pts <=  thr_m1 * 0.5);
+   // H1 + хоть одно подтверждение = торгуем (не ждём идеальный slam всех ТФ)
+   const bool h1_sell_ok = (h1_now < 0) && (m5_now < 0 || m15_now < 0 || below_ema || f.m1_pts < 0);
+   const bool h1_buy_ok  = (h1_now > 0) && (m5_now > 0 || m15_now > 0 || above_ema || f.m1_pts > 0);
    const bool candles_slam_buy  = (h1_now > 0 && m5_now > 0 && m15_now > 0);
    const bool candles_slam_sell = (h1_now < 0 && m5_now < 0 && m15_now < 0);
 
-   if(f.buy_v >= f.sell_v + 2 && f.buy_v >= 3 && !candle_blocks_buy &&
-      (m1_ok_buy || candles_slam_buy))
+   if(h1_sell_ok && f.sell_v >= 2 && !candle_blocks_sell)
+     {
+      f.dir = ORDER_TYPE_SELL;
+      f.clear = true;
+      f.reason = "H1LEAD " + f.reason;
+     }
+   else if(h1_buy_ok && f.buy_v >= 2 && !candle_blocks_buy)
+     {
+      f.dir = ORDER_TYPE_BUY;
+      f.clear = true;
+      f.reason = "H1LEAD " + f.reason;
+     }
+   else if(f.buy_v >= f.sell_v + 2 && f.buy_v >= 3 && !candle_blocks_buy &&
+           (m1_ok_buy || candles_slam_buy))
      {
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
@@ -189,13 +196,13 @@ MarketFlow ReadMarketFlow(const string sym)
       f.clear = true;
       f.reason = (candles_slam_sell ? "CANDLES " : "FLOW ") + f.reason;
      }
-   else if(candles_slam_sell && f.sell_v >= 4)
+   else if(candles_slam_sell && f.sell_v >= 3)
      {
       f.dir = ORDER_TYPE_SELL;
       f.clear = true;
       f.reason = "CANDLES " + f.reason;
      }
-   else if(candles_slam_buy && f.buy_v >= 4)
+   else if(candles_slam_buy && f.buy_v >= 3)
      {
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
@@ -206,7 +213,7 @@ MarketFlow ReadMarketFlow(const string sym)
       f.clear = false;
       if(f.buy_v > f.sell_v) f.dir = ORDER_TYPE_BUY;
       else if(f.sell_v > f.buy_v) f.dir = ORDER_TYPE_SELL;
-      else f.dir = (f.m5_pts >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      else f.dir = (h1_now < 0 || f.m5_pts < 0 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY);
 
       if(candle_blocks_buy && f.dir == ORDER_TYPE_BUY)
          f.dir = ORDER_TYPE_SELL;

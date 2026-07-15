@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.84 — красные H1+M5+M15 → SELL (даже если M1 дёргается вверх)  |
+  //|  v3.85 — постоянный пульс + вход по H1, без часовой тишины         |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.84"
-#property description "Свечи H1/M5/M15. Красные → SELL/ждём. Не покупает против свечей."
+#property version   "3.85"
+#property description "Автофарм золота: H1 задаёт сторону, пульс каждые 10с в журнал."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -23,9 +23,9 @@ input int                  InpMagic     = 26071470;
 input int                  InpDeviation = 30;
 input int                  InpMaxPositions = 3;      // Позиций (меньше — меньше просадка)
 input int                  InpBasketOpen = 3;        // Открывать за заход
-input int                  InpMaxTradesDay = 200;
+input int                  InpMaxTradesDay = 500;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 1500; // Не спамить корзинами
+input int                  InpFarmCooldownMs = 800;  // Быстрый ре-вход после lock/cut
 input bool                 InpRefillBasket = true;
 
 input group "=== Символ ==="
@@ -69,9 +69,9 @@ input double               InpBasketCutLoss = 25.0;     // Резать корз
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
-input double               InpMaxLossMoney = 80.0;
-input bool                 InpMaxLossPct = true;
-input double               InpMaxLossPercent = 3.0;
+input double               InpMaxLossMoney = 400.0;   // Демо: не глушить робот после пары корзин
+input bool                 InpMaxLossPct = false;
+input double               InpMaxLossPercent = 5.0;
 
 #define MAX_SYMS 8
 
@@ -95,6 +95,7 @@ double g_score_buy[MAX_SYMS];
 double g_score_sell[MAX_SYMS];
 string g_score_why[MAX_SYMS];
 string g_wait_why[MAX_SYMS];
+ulong  g_last_pulse_ms = 0;
 
 datetime g_day_start = 0;
 double   g_day_pnl = 0.0;
@@ -268,9 +269,10 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.84 CANDLES | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
+   PrintFormat("ProfitScalper v3.85 LIVE | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f | dayCap=$%.0f",
                _Symbol, InpLot, InpMinProfitMoney,
-               InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss);
+               InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss, InpMaxLossMoney);
+   g_last_pulse_ms = 0;
    return INIT_SUCCEEDED;
   }
 
@@ -289,9 +291,49 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
+void PulseAlive()
+  {
+   if(g_sym_count <= 0) return;
+   if(g_last_pulse_ms > 0 &&
+      (GetTickCount64() - g_last_pulse_ms) < 10000)
+      return;
+   g_last_pulse_ms = GetTickCount64();
+
+   const string sym = g_syms[0];
+   MarketFlow flow = ReadMarketFlow(sym);
+   int open_n = CountOurPositions(sym);
+   PrintFormat(
+      "PULSE %s | %s clear=%s B%d/S%d open=%d dayPnL=%.2f trades=%d pause=%s | %s",
+      sym,
+      flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
+      flow.clear ? "YES" : "no",
+      flow.buy_v, flow.sell_v, open_n,
+      g_day_pnl, g_trades_today,
+      g_trading_paused ? "YES" : "no",
+      flow.reason);
+  }
+
+//+------------------------------------------------------------------+
 void OnTimer()
   {
-   if(g_trading_paused) return;
+   ResetDayIfNeeded();
+   PulseAlive();
+   UpdatePanel();
+
+   if(g_trading_paused)
+     {
+      if(DayRiskHit())
+         return;
+      g_trading_paused = false; // сброс ложного стопа
+     }
+
+   if(DayRiskHit())
+     {
+      g_trading_paused = true;
+      PrintFormat("Дневной лимит: %.2f — пауза (пульс продолжается)", g_day_pnl);
+      return;
+     }
+
    ManageAllPositions();
    for(int i = 0; i < g_sym_count; i++)
       ProtectAgainstFlow(i);
@@ -300,22 +342,27 @@ void OnTimer()
       for(int i = 0; i < g_sym_count; i++)
          FarmSymbol(i);
      }
-   UpdatePanel();
   }
 
 //+------------------------------------------------------------------+
 void OnTick()
   {
    ResetDayIfNeeded();
+   PulseAlive();
    UpdatePanel();
 
    if(g_trading_paused)
-      return;
+     {
+      if(!DayRiskHit())
+         g_trading_paused = false;
+      else
+         return;
+     }
 
    if(DayRiskHit())
      {
       g_trading_paused = true;
-      PrintFormat("Дневной лимит: %.2f — стоп", g_day_pnl);
+      PrintFormat("Дневной лимит: %.2f — пауза", g_day_pnl);
       return;
      }
 
@@ -502,7 +549,7 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
          "ЖДЁМ ясный ход рынка: голоса BUY %d / SELL %d | M1=%.0fpts. Не торгуем шум.",
          flow.buy_v, flow.sell_v, flow.m1_pts);
       if(g_last_skip_ms[idx] == 0 ||
-         (GetTickCount64() - g_last_skip_ms[idx]) >= 8000)
+         (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
         {
          g_last_skip_ms[idx] = GetTickCount64();
          PrintFormat("WAIT %s | %s | %s", g_syms[idx], g_wait_why[idx], flow.reason);
@@ -572,7 +619,7 @@ void ProtectAgainstFlow(const int idx)
    if(basket <= -MathAbs(InpBasketCutLoss))
      {
       CloseOurSymbol(sym, StringFormat("basket loss $%.2f <= -%.2f", basket, InpBasketCutLoss));
-      g_pause_until_ms[idx] = GetTickCount64() + 12000;
+      g_pause_until_ms[idx] = GetTickCount64() + 2500;
       return;
      }
 
@@ -622,7 +669,7 @@ void ProtectAgainstFlow(const int idx)
          "против свечей/потока %s B%d/S%d M1=%.0f basket=$%.2f | %s",
          flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
          flow.buy_v, flow.sell_v, flow.m1_pts, basket, flow.reason));
-      g_pause_until_ms[idx] = GetTickCount64() + 15000;
+      g_pause_until_ms[idx] = GetTickCount64() + 3000;
      }
   }
 
@@ -904,7 +951,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.84 — свечи H1/M5/M15\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nВсе красные → SELL. Все зелёные → BUY. Иначе ждём.",
+              "ProfitScalper v3.85 LIVE — автофарм\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nH1 задаёт сторону. Пульс каждые 10с в Experts.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
