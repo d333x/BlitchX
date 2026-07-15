@@ -574,14 +574,15 @@ void LogBlock(const int idx, const string why)
 //+------------------------------------------------------------------+
 bool BrokerTradeOk(string &why)
   {
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+     { why = "нет связи с сервером"; return false; }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
      { why = "терминал: торговля OFF"; return false; }
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
      { why = "Алготорговля OFF (кнопка сверху)"; return false; }
    if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
-     { why = "счёт запретил торговлю"; return false; }
-   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
-     { why = "счёт запретил советников"; return false; }
+     { why = "счёт ещё не разрешил торговлю (логин?)"; return false; }
+   // ACCOUNT_TRADE_EXPERT на демо иногда 0 в первые секунды после старта — не блокируем им
    return true;
   }
 
