@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
-//|  v3.83: направление по СВЕЧАМ (M5/M15/H1), а не по микро-пипу M1 |
+//|  v3.90: только качественный вход — M1+M5+H1 в одну сторону         |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -16,9 +16,9 @@ struct MarketFlow
   {
    int    buy_v;
    int    sell_v;
-   double m1_pts;   // ход M1 за look-баров (со знаком)
+   double m1_pts;
    double m5_pts;
-   bool   clear;    // достаточно голосов и М1 согласен
+   bool   clear;
    ENUM_ORDER_TYPE dir;
    string reason;
   };
@@ -81,7 +81,6 @@ void VoteSlope(const double slope_pts, const double thr,
   }
 
 //+------------------------------------------------------------------+
-// Формирующаяся свеча: +1 / −1 / 0
 int FormingCandleDir(const string sym, const ENUM_TIMEFRAMES tf, string &why, const string tag)
   {
    double o[], c[];
@@ -96,7 +95,20 @@ int FormingCandleDir(const string sym, const ENUM_TIMEFRAMES tf, string &why, co
   }
 
 //+------------------------------------------------------------------+
-// Главное: куда идут СВЕЧИ (то что видно глазом), M1 — только подтверждение.
+int ClosedCandleDir(const string sym, const ENUM_TIMEFRAMES tf, string &why, const string tag)
+  {
+   double o[], c[];
+   ArraySetAsSeries(o, true);
+   ArraySetAsSeries(c, true);
+   if(CopyOpen(sym, tf, 1, 1, o) < 1 || CopyClose(sym, tf, 1, 1, c) < 1)
+      return 0;
+   if(c[0] > o[0]) { why += tag + "↑ "; return 1; }
+   if(c[0] < o[0]) { why += tag + "↓ "; return -1; }
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+// Качество > частота: не входим против минутного импульса.
 MarketFlow ReadMarketFlow(const string sym)
   {
    MarketFlow f;
@@ -108,10 +120,10 @@ MarketFlow ReadMarketFlow(const string sym)
 
    double atr_m1 = ATRPts(sym, PERIOD_M1, 14);
    double atr_m5 = ATRPts(sym, PERIOD_M5, 14);
-   double thr_m1 = MathMax(atr_m1 * 0.28, 22.0);
-   double thr_m5 = MathMax(atr_m5 * 0.20, 35.0);
-   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.18, 45.0);
-   double thr_h1 = MathMax(ATRPts(sym, PERIOD_H1, 14) * 0.12, 60.0);
+   double thr_m1 = MathMax(atr_m1 * 0.25, 20.0);
+   double thr_m5 = MathMax(atr_m5 * 0.18, 30.0);
+   double thr_m15 = MathMax(ATRPts(sym, PERIOD_M15, 14) * 0.16, 40.0);
+   double thr_h1 = MathMax(ATRPts(sym, PERIOD_H1, 14) * 0.10, 50.0);
 
    f.m1_pts = Pts(sym, CloseSlope(sym, PERIOD_M1, 8));
    f.m5_pts = Pts(sym, CloseSlope(sym, PERIOD_M5, 4));
@@ -119,20 +131,20 @@ MarketFlow ReadMarketFlow(const string sym)
    double h1_pts = Pts(sym, CloseSlope(sym, PERIOD_H1, 3));
    double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3));
 
-   // Структура: M5 / M15 / H1 (вес как у глаза на графике)
    VoteSlope(f.m5_pts, thr_m5, f.buy_v, f.sell_v, f.reason, "M5");
    VoteSlope(m15_pts, thr_m15, f.buy_v, f.sell_v, f.reason, "M15");
    VoteSlope(h1_pts, thr_h1, f.buy_v, f.sell_v, f.reason, "H1");
+   VoteSlope(f.m1_pts, thr_m1, f.buy_v, f.sell_v, f.reason, "M1");
 
-   // Текущие свечи — то, что пользователь видит
    const int m5_now = FormingCandleDir(sym, PERIOD_M5, f.reason, "M5now");
    const int m15_now = FormingCandleDir(sym, PERIOD_M15, f.reason, "M15now");
    const int h1_now = FormingCandleDir(sym, PERIOD_H1, f.reason, "H1now");
+   const int h1_cl = ClosedCandleDir(sym, PERIOD_H1, f.reason, "H1cl");
    if(m5_now > 0) f.buy_v++; else if(m5_now < 0) f.sell_v++;
    if(m15_now > 0) f.buy_v++; else if(m15_now < 0) f.sell_v++;
-   if(h1_now > 0) f.buy_v += 2; else if(h1_now < 0) f.sell_v += 2; // H1 важнее
+   if(h1_now > 0) f.buy_v++; else if(h1_now < 0) f.sell_v++;
+   if(h1_cl > 0) f.buy_v++; else if(h1_cl < 0) f.sell_v++;
 
-   // EMA20 M5
    bool above_ema = false, below_ema = false;
    int ema = iMA(sym, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
    if(ema != INVALID_HANDLE)
@@ -150,79 +162,49 @@ MarketFlow ReadMarketFlow(const string sym)
       IndicatorRelease(ema);
      }
 
-   // M1 только подпись / мягкое подтверждение (не перебивает свечи)
-   if(f.m1_pts >= thr_m1) f.reason += "M1↑ ";
-   else if(f.m1_pts <= -thr_m1) f.reason += "M1↓ ";
    if(m1_fast >= thr_m1 * 0.55) f.reason += "M1f↑ ";
    else if(m1_fast <= -thr_m1 * 0.55) f.reason += "M1f↓ ";
 
    f.reason += StringFormat("|M1=%.0f M5=%.0f M15=%.0f H1=%.0f", f.m1_pts, f.m5_pts, m15_pts, h1_pts);
 
-   // Жёсткий запрет только против H1 (то что на графике у глаза)
-   const bool candle_blocks_buy  = (h1_now < 0);
-   const bool candle_blocks_sell = (h1_now > 0);
+   // M1 обязательно с нами — иначе мгновенный минус на золоте
+   const bool m1_with_buy  = (f.m1_pts >= thr_m1 * 0.35 && m1_fast >= -thr_m1 * 0.25);
+   const bool m1_with_sell = (f.m1_pts <= -thr_m1 * 0.35 && m1_fast <= thr_m1 * 0.25);
 
-   const bool m1_ok_buy  = (f.m1_pts >= -thr_m1 * 0.5);
-   const bool m1_ok_sell = (f.m1_pts <=  thr_m1 * 0.5);
-   // H1 + хоть одно подтверждение = торгуем (не ждём идеальный slam всех ТФ)
-   const bool h1_sell_ok = (h1_now < 0) && (m5_now < 0 || m15_now < 0 || below_ema || f.m1_pts < 0);
-   const bool h1_buy_ok  = (h1_now > 0) && (m5_now > 0 || m15_now > 0 || above_ema || f.m1_pts > 0);
-   const bool candles_slam_buy  = (h1_now > 0 && m5_now > 0 && m15_now > 0);
-   const bool candles_slam_sell = (h1_now < 0 && m5_now < 0 && m15_now < 0);
+   // Структура: закрытый H1 или сильный наклон H1 + текущие M5/H1
+   const bool struct_buy =
+      (h1_cl > 0 || h1_pts >= thr_h1 * 0.35 || h1_now > 0) &&
+      (m5_now > 0) &&
+      (above_ema || m15_now > 0 || f.m5_pts > 0);
+   const bool struct_sell =
+      (h1_cl < 0 || h1_pts <= -thr_h1 * 0.35 || h1_now < 0) &&
+      (m5_now < 0) &&
+      (below_ema || m15_now < 0 || f.m5_pts < 0);
 
-   if(h1_sell_ok && f.sell_v >= 2 && !candle_blocks_sell)
-     {
-      f.dir = ORDER_TYPE_SELL;
-      f.clear = true;
-      f.reason = "H1LEAD " + f.reason;
-     }
-   else if(h1_buy_ok && f.buy_v >= 2 && !candle_blocks_buy)
+   // Не покупать в красный H1-сейчас; не продавать в зелёный H1-сейчас
+   const bool wick_blocks_buy  = (h1_now < 0 && h1_cl <= 0);
+   const bool wick_blocks_sell = (h1_now > 0 && h1_cl >= 0);
+
+   if(struct_buy && m1_with_buy && !wick_blocks_buy && f.buy_v >= f.sell_v + 2 && f.buy_v >= 4)
      {
       f.dir = ORDER_TYPE_BUY;
       f.clear = true;
-      f.reason = "H1LEAD " + f.reason;
+      f.reason = "QUALITY " + f.reason;
      }
-   else if(f.buy_v >= f.sell_v + 2 && f.buy_v >= 3 && !candle_blocks_buy &&
-           (m1_ok_buy || candles_slam_buy))
-     {
-      f.dir = ORDER_TYPE_BUY;
-      f.clear = true;
-      f.reason = (candles_slam_buy ? "CANDLES " : "FLOW ") + f.reason;
-     }
-   else if(f.sell_v >= f.buy_v + 2 && f.sell_v >= 3 && !candle_blocks_sell &&
-           (m1_ok_sell || candles_slam_sell))
+   else if(struct_sell && m1_with_sell && !wick_blocks_sell && f.sell_v >= f.buy_v + 2 && f.sell_v >= 4)
      {
       f.dir = ORDER_TYPE_SELL;
       f.clear = true;
-      f.reason = (candles_slam_sell ? "CANDLES " : "FLOW ") + f.reason;
-     }
-   else if(candles_slam_sell && f.sell_v >= 3)
-     {
-      f.dir = ORDER_TYPE_SELL;
-      f.clear = true;
-      f.reason = "CANDLES " + f.reason;
-     }
-   else if(candles_slam_buy && f.buy_v >= 3)
-     {
-      f.dir = ORDER_TYPE_BUY;
-      f.clear = true;
-      f.reason = "CANDLES " + f.reason;
+      f.reason = "QUALITY " + f.reason;
      }
    else
      {
       f.clear = false;
       if(f.buy_v > f.sell_v) f.dir = ORDER_TYPE_BUY;
       else if(f.sell_v > f.buy_v) f.dir = ORDER_TYPE_SELL;
-      else f.dir = (h1_now < 0 || f.m5_pts < 0 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY);
-
-      if(candle_blocks_buy && f.dir == ORDER_TYPE_BUY)
-         f.dir = ORDER_TYPE_SELL;
-      if(candle_blocks_sell && f.dir == ORDER_TYPE_SELL)
-         f.dir = ORDER_TYPE_BUY;
-
+      else f.dir = (f.m1_pts >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
       f.reason = "CHOP " + f.reason;
-      if(candle_blocks_buy) f.reason = "NOBUY " + f.reason;
-      if(candle_blocks_sell) f.reason = "NOSELL " + f.reason;
+      if(!m1_with_buy && !m1_with_sell) f.reason = "WAIT_M1 " + f.reason;
      }
 
    return f;

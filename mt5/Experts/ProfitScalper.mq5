@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.87 — не резать SELL при красном H1 из‑за зелёных M5/M15         |
+  //|  v3.90 — профит-режим: качественный вход, 1 позиция, быстрый lock  |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.87"
-#property description "Автофарм: держит корзину по H1, не режет из-за шума M5/M15."
+#property version   "3.90"
+#property description "Профит: вход только M1+M5+H1 вместе. 0.05 лот. Lock $1.5. Без входа против M1."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -18,37 +18,37 @@ enum ENUM_TRADE_DIRECTION
 
 input group "=== Торговля ==="
 input ENUM_TRADE_DIRECTION InpDirection = DIR_AUTO;
-input double               InpLot       = 0.10;      // Лот (на графике золота = лот золота)
+input double               InpLot       = 0.05;      // Меньше лот → меньше мгновенный минус на золоте
 input int                  InpMagic     = 26071470;
 input int                  InpDeviation = 30;
-input int                  InpMaxPositions = 3;      // Позиций (меньше — меньше просадка)
-input int                  InpBasketOpen = 3;        // Открывать за заход
-input int                  InpMaxTradesDay = 500;
+input int                  InpMaxPositions = 1;      // Одна позиция — проще взять плюс
+input int                  InpBasketOpen = 1;
+input int                  InpMaxTradesDay = 300;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 800;  // Быстрый ре-вход после lock/cut
-input bool                 InpRefillBasket = true;
+input int                  InpFarmCooldownMs = 4000; // Не ревенж-вход сразу после сделки
+input bool                 InpRefillBasket = false;  // Не доливать
 
 input group "=== Символ ==="
-input bool                 InpTradeOnlyChart = true; // Только символ ЭТОГО графика
-input string               InpAlsoSymbols = "";      // Пусто = никого больше не трогать
+input bool                 InpTradeOnlyChart = true;
+input string               InpAlsoSymbols = "";
 
 input group "=== Предикт прибыли ==="
-input bool                 InpUseKnowledge = true;     // Свечи → вверх или вниз
-input bool                 InpSmartBigProfit = true;   // Сильный предикт → держим на большой плюс
-input double               InpMinProfitMoney = 0.50;   // Мин. плюс ($) если предикт слабый
-input double               InpBigProfitMoney = 5.00;   // Цель ($) при СИЛЬНОМ предикте
-input double               InpStrongScoreGap = 6.0;    // Насколько buy/sell должны разойтись
-input double               InpStrongRR = 3.0;          // TP в R при сильном предикте
-input double               InpWeakRR = 1.5;            // TP в R при слабом предикте
+input bool                 InpUseKnowledge = true;
+input bool                 InpSmartBigProfit = true;
+input double               InpMinProfitMoney = 1.50;   // Забираем плюс раньше/увереннее
+input double               InpBigProfitMoney = 4.00;
+input double               InpStrongScoreGap = 8.0;
+input double               InpStrongRR = 2.5;
+input double               InpWeakRR = 1.2;
 input bool                 InpCloseOnProfit  = true;
 input bool                 InpCloseEachAlone = true;
 input int                  InpLockTimerMs    = 100;
 input bool                 InpUseBreakEven = true;
-input double               InpBE_R = 0.8;
-input double               InpBE_OffsetPts = 3.0;
+input double               InpBE_R = 0.6;
+input double               InpBE_OffsetPts = 2.0;
 input bool                 InpUseTrailing = true;
-input double               InpTrailStart_R = 1.0;
-input double               InpTrailATR_Mult = 0.9;
+input double               InpTrailStart_R = 0.8;
+input double               InpTrailATR_Mult = 0.7;
 
 input group "=== Анализ ==="
 input ENUM_TIMEFRAMES      InpTrendTF   = PERIOD_H1;
@@ -56,20 +56,20 @@ input ENUM_TIMEFRAMES      InpSignalTF  = PERIOD_M15;
 input int                  InpFastEMA   = 20;
 input int                  InpSlowEMA   = 50;
 input int                  InpATRPeriod = 14;
-input double               InpATR_SL_Mult = 1.8;
+input double               InpATR_SL_Mult = 1.2;       // Ближе SL на качественном входе
 input bool                 InpUseSpreadFilter = true;
-input int                  InpMaxSpreadPts = 800;      // золото/демо часто шире
+input int                  InpMaxSpreadPts = 500;
 
 input group "=== База знаний ==="
 input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
-input bool                 InpRequireClearFlow = true; // Только когда M1+голоса согласны
-input bool                 InpCloseAgainstFlow = true;  // Закрыть корзину если рынок развернулся
-input double               InpBasketCutLoss = 25.0;     // Резать корзину по реальному $ (золото 0.3 лота)
+input bool                 InpRequireClearFlow = true;
+input bool                 InpCloseAgainstFlow = true;
+input double               InpBasketCutLoss = 7.0;     // Под 0.05 лот: режем быстрее маленький минус
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
-input double               InpMaxLossMoney = 400.0;   // Демо: не глушить робот после пары корзин
+input double               InpMaxLossMoney = 250.0;
 input bool                 InpMaxLossPct = false;
 input double               InpMaxLossPercent = 5.0;
 
@@ -269,9 +269,8 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.87 LIVE | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f | dayCap=$%.0f",
-               _Symbol, InpLot, InpMinProfitMoney,
-               InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss, InpMaxLossMoney);
+   PrintFormat("ProfitScalper v3.90 PROFIT | chart=%s | lot=%.2f | lock$=%.2f | cut=$%.1f | maxPos=%d",
+               _Symbol, InpLot, InpMinProfitMoney, InpBasketCutLoss, InpMaxPositions);
    g_last_pulse_ms = 0;
    return INIT_SUCCEEDED;
   }
@@ -460,10 +459,10 @@ void FarmSymbol(const int idx)
         }
      }
 
-   // Меньше «ковыряния»: 3 вместо агрессивной пятёрки при слабом flow
-   int basket = InpBasketOpen;
+   // Меньше «ковыряния»: на профит-режиме всегда 1
+   int basket = MathMin(InpBasketOpen, InpMaxPositions);
    if(!g_pred_strong[idx])
-      basket = MathMin(basket, 3);
+      basket = 1;
 
    int need = MathMin(basket, InpMaxPositions - open_now);
    if(need <= 0)
@@ -670,7 +669,7 @@ void ProtectAgainstFlow(const int idx)
    if(basket <= -MathAbs(InpBasketCutLoss))
      {
       CloseOurSymbol(sym, StringFormat("basket loss $%.2f <= -%.2f", basket, InpBasketCutLoss));
-      g_pause_until_ms[idx] = GetTickCount64() + 2500;
+      g_pause_until_ms[idx] = GetTickCount64() + 20000; // не ревенж сразу
       return;
      }
 
@@ -696,7 +695,7 @@ void ProtectAgainstFlow(const int idx)
    bool against = ((our == POSITION_TYPE_BUY && flow.dir == ORDER_TYPE_SELL) ||
                    (our == POSITION_TYPE_SELL && flow.dir == ORDER_TYPE_BUY));
 
-   // Режем только если H1 развернулся против нашей стороны (не из-за шума M5/M15)
+   // Режем по H1 только если уже в минусе (не выбивать плюс фитилём)
    bool candles_vs =
       (our == POSITION_TYPE_BUY  && StringFind(flow.reason, "H1now↓") >= 0) ||
       (our == POSITION_TYPE_SELL && StringFind(flow.reason, "H1now↑") >= 0);
@@ -704,19 +703,21 @@ void ProtectAgainstFlow(const int idx)
    if(!InpCloseAgainstFlow)
       return;
 
-   // Поток против нас — только при clear; свечи H1 — всегда
-   if(against && !flow.clear && !candles_vs)
-      return;
-   if(!against && !candles_vs)
-      return;
-
-   if(candles_vs || (against && flow.clear && (basket < -1.0 || MathAbs(flow.m1_pts) >= 80.0)))
+   if(against && flow.clear && basket < -1.5)
      {
       CloseOurSymbol(sym, StringFormat(
-         "против свечей/потока %s B%d/S%d M1=%.0f basket=$%.2f | %s",
+         "против потока %s B%d/S%d basket=$%.2f | %s",
          flow.dir == ORDER_TYPE_BUY ? "BUY" : "SELL",
-         flow.buy_v, flow.sell_v, flow.m1_pts, basket, flow.reason));
-      g_pause_until_ms[idx] = GetTickCount64() + 3000;
+         flow.buy_v, flow.sell_v, basket, flow.reason));
+      g_pause_until_ms[idx] = GetTickCount64() + 15000;
+      return;
+     }
+
+   if(candles_vs && basket < -2.0)
+     {
+      CloseOurSymbol(sym, StringFormat(
+         "H1 разворот против нас basket=$%.2f | %s", basket, flow.reason));
+      g_pause_until_ms[idx] = GetTickCount64() + 15000;
      }
   }
 
@@ -1001,7 +1002,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.86 LIVE — автофарм\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nH1 сторона. Пульс 10с. Индикаторы не стопят вход.",
+              "ProfitScalper v3.90 PROFIT\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nВход только M1+M5+H1 вместе. Цель: плюс, не спам.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
