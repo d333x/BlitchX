@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              ChartKnowledge.mqh  |
-//|  v3.98: LTF cascade — вход через конфликт H1, если M15+M5+M1 жёстко |
+//|  v3.99: cascade жёстче + только при real $ ожидании               |
 //+------------------------------------------------------------------+
 #ifndef CHART_KNOWLEDGE_MQH
 #define CHART_KNOWLEDGE_MQH
@@ -412,13 +412,13 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
    const bool ltf_buy  = m15_up && m5_up && m1_up;
    const bool ltf_sell = m15_dn && m5_dn && m1_dn;
    const double micro_gap = MathAbs(micro_buy - micro_sell);
-   // Hard cascade: как у юзера — μ SELL 18 / BUY 1, EMA ниже, все LTF↓, H1↑
+   // Hard cascade: μ gap большой + все 3 LTF; без «почти-сигнала»
    const bool strong_sell_ltf =
-      (ltf_sell && micro_sell >= micro_buy + 4.0 &&
-       (below_ema || micro_gap >= 6.0) && m1_with_sell && !wick_blocks_sell);
+      (ltf_sell && micro_sell >= micro_buy + 6.0 && micro_gap >= 8.0 &&
+       below_ema && m1_with_sell && !wick_blocks_sell);
    const bool strong_buy_ltf =
-      (ltf_buy && micro_buy >= micro_sell + 4.0 &&
-       (above_ema || micro_gap >= 6.0) && m1_with_buy && !wick_blocks_buy);
+      (ltf_buy && micro_buy >= micro_sell + 6.0 && micro_gap >= 8.0 &&
+       above_ema && m1_with_buy && !wick_blocks_buy);
 
    // Конфликт: мягкий штраф, НО не режем conf в 49%, если LTF cascade жёсткий
    if(conflict && !(strong_sell_ltf || strong_buy_ltf))
@@ -443,9 +443,11 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
    const bool conf_mid  = (f.conf >= min_enter_conf * 0.85);
    const bool weight_gap = (micro_gap >= 3.5);
 
-   // BIG: либо чистое выравнивание, либо hard LTF cascade поверх H1-конфликта
-   if(strong_sell_ltf || strong_buy_ltf)
-      f.opportunity = (money_mid ? OPP_BIG : OPP_MID);
+   // BIG: cascade только если ожидаемый ход покрывает lock (не mid-крошки)
+   if((strong_sell_ltf || strong_buy_ltf) && money_big && f.align_score >= 4)
+      f.opportunity = OPP_BIG;
+   else if(strong_sell_ltf || strong_buy_ltf)
+      f.opportunity = (money_mid ? OPP_MID : OPP_SMALL);
    else if(conflict)
       f.opportunity = (money_mid && conf_mid && f.align_score >= 3) ? OPP_MID : OPP_SMALL;
    else if(money_big && conf_big && f.align_score >= 4 && weight_gap)
@@ -499,16 +501,16 @@ MarketFlow ReadMarketFlow(const string sym, const double lot_for_expect,
         { enter_sell = true; f.conf = MathMax(f.conf, min_enter_conf); }
      }
 
-   // v3.98 CASCADE: H1 против, но M15+M5+M1 + μ разрыв → ВХОД (как шорт «на глаз»)
-   if(f.opportunity == OPP_BIG && money_mid)
+   // v3.99 CASCADE: только hard gap + money_big (lock покрыт ожиданием)
+   if(f.opportunity == OPP_BIG && money_big && f.align_score >= 4)
      {
-      if(strong_sell_ltf && f.dir == ORDER_TYPE_SELL && struct_sell)
+      if(strong_sell_ltf && f.dir == ORDER_TYPE_SELL && struct_sell && micro_gap >= 8.0)
         {
          enter_sell = true;
          f.conf = MathMax(f.conf, min_enter_conf);
          f.reason = "CASCADE_SELL " + f.reason;
         }
-      if(strong_buy_ltf && f.dir == ORDER_TYPE_BUY && struct_buy)
+      if(strong_buy_ltf && f.dir == ORDER_TYPE_BUY && struct_buy && micro_gap >= 8.0)
         {
          enter_buy = true;
          f.conf = MathMax(f.conf, min_enter_conf);

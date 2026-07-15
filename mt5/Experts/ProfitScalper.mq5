@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-//|  v3.98 — LTF cascade: M15+M5+M1 жёстко → вход даже при H1 против  |
-//|  Больше не «ЖДЁМ 49% МЕЛКИЙ» при μ SELL 18 / BUY 1                |
+//|  v3.99 — QUALITY: без крошек $0–4 / без спама; lock > cut         |
+//|  BE/trail выкл; кулдаун после любой сделки; cascade жёстче        |
 #property copyright "ProfitScalper"
-#property version   "3.98"
-#property description "CASCADE: сильный LTF поток входит через конфликт H1. Мелкий шум — ждём."
+#property version   "3.99"
+#property description "Держим до лока $. Без микро-спама. Сумма важнее частоты."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -25,8 +25,9 @@ input int                  InpMaxPositions = 1;
 input int                  InpBasketOpen = 1;
 input int                  InpMaxTradesDay = 120;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 8000;   // после успешного входа
-input int                  InpLossCooldownMs = 45000;  // после минуса — короткий cooldown
+input int                  InpFarmCooldownMs = 90000;  // пауза после входа / плюса (не спамить)
+input int                  InpLossCooldownMs = 180000; // после минуса — длинная пауза
+input int                  InpWinCooldownMs  = 120000; // после любого плюса — не жать снова
 input bool                 InpRefillBasket = false;
 
 input group "=== Символ ==="
@@ -37,21 +38,22 @@ input group "=== Предикт прибыли (СУММА $) ==="
 input bool                 InpUseKnowledge = true;
 input bool                 InpSmartBigProfit = true;
 input bool                 InpOnlyBigOpportunity = true; // НЕ торгуем МЕЛКИЙ/СРЕДНИЙ
-input double               InpMinEnterConf = 72.0;       // порог уверенности для BIG
-input double               InpMinProfitMoney = 8.00;    // цель лока (не крошки $1–2)
-input double               InpBigProfitMoney = 12.00;   // сильный BIG — держим дольше
-input double               InpArmLockMoney = 6.00;      // peak-lock только после реального плюса
+input double               InpMinEnterConf = 78.0;       // выше порог — меньше шума
+input double               InpMinProfitMoney = 12.00;   // цель лока (не крошки $0–4)
+input double               InpBigProfitMoney = 20.00;   // сильный BIG — держим дольше
+input double               InpArmLockMoney = 10.00;     // peak-lock только после реального плюса
 input double               InpStrongScoreGap = 8.0;
 input double               InpStrongRR = 2.5;           // TP дальше cut — expectancy > 0
 input double               InpWeakRR = 1.5;
 input bool                 InpCloseOnProfit  = true;
 input bool                 InpCloseEachAlone = true;
 input int                  InpLockTimerMs    = 100;
-input bool                 InpUseBreakEven = true;
-input double               InpBE_R = 0.5;
-input double               InpBE_OffsetPts = 2.0;
-input bool                 InpUseTrailing = true;
-input double               InpTrailStart_R = 0.6;
+input int                  InpMinHoldSec     = 40;      // не закрывать в плюс раньше (анти-крошки)
+input bool                 InpUseBreakEven = false;     // BE резал +$0.10 — выкл по умолчанию
+input double               InpBE_R = 1.2;
+input double               InpBE_OffsetPts = 5.0;
+input bool                 InpUseTrailing = false;      // trail тоже делал крошки
+input double               InpTrailStart_R = 1.5;
 input double               InpTrailATR_Mult = 0.6;
 input bool                 InpSendStopsAtOpen = false; // false = рынок без SL/TP (лок/кат сам EA)
 
@@ -70,9 +72,9 @@ input bool                 InpStickyLastDir = false;
 input int                  InpKnowledgeGap = 0;
 input bool                 InpRequireClearFlow = true;
 input bool                 InpCloseAgainstFlow = false;
-input double               InpBasketCutLoss = 4.00;    // 1 cut < 1 lock ($8)
-input int                  InpCutGraceSec = 45;
-input double               InpPanicCutMoney = 5.00;    // было $12 = 6 локов по $2; теперь ≤ 1 лока
+input double               InpBasketCutLoss = 5.00;    // cut << lock ($12): ~0.4R
+input int                  InpCutGraceSec = 55;
+input double               InpPanicCutMoney = 8.00;    // panic < 1 lock; не режем по -$5 крошки-победителей
 
 input group "=== Защита ==="
 input bool                 InpMaxLossDay = true;
@@ -304,7 +306,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.98 CASCADE | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f | LTF-cascade (BUY=SELL)",
+   PrintFormat("ProfitScalper v3.99 QUALITY | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f | no-crumb (BUY=SELL)",
                _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney, InpPanicCutMoney);
    g_last_pulse_ms = 0;
    g_last_signal_print_ms = 0;
@@ -466,7 +468,7 @@ void DrawSignalOnChart()
    // Компактная панель СВЕРХУ СПРАВА — не лезет на one-click и не дублирует Comment
    int y = 18;
    HudLabel("PS_HUD0", y, 11, "Segoe UI Semibold", clrWhite,
-            "ProfitScalper  ·  v3.98");
+            "ProfitScalper  ·  v3.99");
    y += 20;
    HudLabel("PS_HUD1", y, 9, "Consolas", C'130,140,155',
             "────────────────────────");
@@ -625,9 +627,9 @@ void FarmSymbol(const int idx)
                                 g_lock_target[idx], g_align_score[idx]);
    bool can_trade = g_signal_enter[idx];
 
-   if(can_trade && g_expected_usd[idx] < InpMinProfitMoney * 0.90)
+   if(can_trade && g_expected_usd[idx] < InpMinProfitMoney)
      {
-      LogBlock(idx, StringFormat("expect$=%.0f < lock$=%.2f", g_expected_usd[idx], InpMinProfitMoney));
+      LogBlock(idx, StringFormat("expect$=%.0f < lock$=%.2f — ждём ход", g_expected_usd[idx], InpMinProfitMoney));
       can_trade = false;
      }
 
@@ -683,7 +685,7 @@ void FarmSymbol(const int idx)
    if(g_pause_until_ms[idx] > 0 && GetTickCount64() < g_pause_until_ms[idx])
      {
       ulong left = (g_pause_until_ms[idx] - GetTickCount64()) / 1000;
-      LogBlock(idx, StringFormat("cooldown после лосса %lluс", left));
+      LogBlock(idx, StringFormat("пауза %lluс (качество > частота)", left));
       return;
      }
 
@@ -862,7 +864,7 @@ bool ResolveDir(const int idx, const MarketScore &s, ENUM_ORDER_TYPE &type, stri
    bool allow = flow.clear;
    if(InpOnlyBigOpportunity && flow.opportunity != OPP_BIG)
       allow = false;
-   if(allow && flow.expected_usd < InpMinProfitMoney * 0.90)
+   if(allow && flow.expected_usd < InpMinProfitMoney)
       allow = false;
    g_signal_enter[idx] = allow;
    type = flow.dir;
@@ -985,24 +987,24 @@ void ProtectAgainstFlow(const int idx)
       break;
      }
 
-   // Микро (M1/M5) развернулся против — режем раньше половинным cut (меньший убыток)
-   if(our >= 0 && age >= 12)
+   // Микро разворот — только после нормального возраста, cut не крошечный
+   if(our >= 0 && age >= MathMax(InpMinHoldSec, 35))
      {
       MarketFlow flow_m = FlowFor(sym);
       bool buy_wrong =
          (our == POSITION_TYPE_BUY && flow_m.dir == ORDER_TYPE_SELL &&
           StringFind(flow_m.analysis, "M5:↓") >= 0 && StringFind(flow_m.analysis, "M1:↓") >= 0 &&
-          flow_m.align_score >= 3);
+          flow_m.align_score >= 4);
       bool sell_wrong =
          (our == POSITION_TYPE_SELL && flow_m.dir == ORDER_TYPE_BUY &&
           StringFind(flow_m.analysis, "M5:↑") >= 0 && StringFind(flow_m.analysis, "M1:↑") >= 0 &&
-          flow_m.align_score >= 3);
-      double early_cut = MathAbs(InpBasketCutLoss) * 0.55;
+          flow_m.align_score >= 4);
+      double early_cut = MathMax(MathAbs(InpBasketCutLoss) * 0.85, MathAbs(InpPanicCutMoney) * 0.70);
       if((buy_wrong || sell_wrong) && basket <= -early_cut)
         {
          CloseOurSymbol(sym, StringFormat(
             "MICRO против $%.2f <= -%.2f age=%ds | %s", basket, early_cut, age, flow_m.analysis));
-         g_pause_until_ms[idx] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 30000);
+         g_pause_until_ms[idx] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 60000);
          g_peak_money[idx] = 0.0;
          return;
         }
@@ -1243,15 +1245,22 @@ void ManageOne(const ulong ticket)
    if(money > g_peak_money[idx])
       g_peak_money[idx] = money;
 
-   // Цель достигнута — полный lock
-   if(InpCloseOnProfit && InpCloseEachAlone && money >= lock_at)
+   datetime pos_time = (datetime)PositionGetInteger(POSITION_TIME);
+   int hold_sec = (int)(TimeCurrent() - pos_time);
+   bool held_enough = (hold_sec >= MathMax(InpMinHoldSec, 0));
+
+   // Полный lock — только после min hold (иначе крошки на шуме)
+   if(InpCloseOnProfit && InpCloseEachAlone && held_enough && money >= lock_at)
      {
       if(trade.PositionClose(ticket, InpDeviation))
         {
          for(int i = 0; i < g_sym_count; i++)
             if(g_syms[i] == sym)
+              {
                g_last_farm_ms[i] = GetTickCount64();
-         PrintFormat("LOCK NOW %s #%I64u +%.2f (>=%.2f) alone", sym, ticket, money, lock_at);
+               g_pause_until_ms[i] = GetTickCount64() + (ulong)MathMax(InpWinCooldownMs, InpFarmCooldownMs);
+              }
+         PrintFormat("LOCK NOW %s #%I64u +%.2f (>=%.2f) age=%ds", sym, ticket, money, lock_at, hold_sec);
          g_peak_money[idx] = 0.0;
         }
       else
@@ -1260,27 +1269,33 @@ void ManageOne(const ulong ticket)
       return;
      }
 
-   // Peak-lock: только после РЕАЛЬНОГО плюса (arm), и не отдаём крошки.
-   // Раньше arm=$1 → +$1.2 локали, а panic −$12 съедал 6 таких.
-   double arm = MathMax(InpArmLockMoney, lock_at * 0.55);
-   double min_keep = MathMax(arm * 0.85, InpMinProfitMoney * 0.50);
-   if(InpCloseOnProfit && g_peak_money[idx] >= arm &&
+   // Peak-lock: только около цели (не +$2 при lock $12). arm высокий.
+   double arm = MathMax(InpArmLockMoney, lock_at * 0.80);
+   double min_keep = MathMax(arm * 0.92, lock_at * 0.75);
+   if(InpCloseOnProfit && held_enough &&
+      g_peak_money[idx] >= arm &&
       money >= min_keep &&
-      money <= g_peak_money[idx] - MathMax(0.80, arm * 0.12))
+      money <= g_peak_money[idx] - MathMax(1.20, arm * 0.10))
      {
       if(trade.PositionClose(ticket, InpDeviation))
         {
-         PrintFormat("LOCK PEAK %s #%I64u +%.2f (peak=%.2f arm=%.2f keep>=%.2f)",
-                     sym, ticket, money, g_peak_money[idx], arm, min_keep);
+         PrintFormat("LOCK PEAK %s #%I64u +%.2f (peak=%.2f arm=%.2f keep>=%.2f age=%ds)",
+                     sym, ticket, money, g_peak_money[idx], arm, min_keep, hold_sec);
          g_peak_money[idx] = 0.0;
          for(int i = 0; i < g_sym_count; i++)
             if(g_syms[i] == sym)
+              {
                g_last_farm_ms[i] = GetTickCount64();
+               g_pause_until_ms[i] = GetTickCount64() + (ulong)MathMax(InpWinCooldownMs, InpFarmCooldownMs);
+              }
          return;
         }
      }
 
-   // BE / trailing — только если ещё не в зоне мгновенного lock
+   // BE / trailing по умолчанию ВЫКЛ — иначе снова +$0.10 vs −$7
+   if(!InpUseBreakEven && !InpUseTrailing)
+      return;
+
    long type = PositionGetInteger(POSITION_TYPE);
    double open = PositionGetDouble(POSITION_PRICE_OPEN);
    double sl = PositionGetDouble(POSITION_SL);
@@ -1294,11 +1309,12 @@ void ManageOne(const ulong ticket)
    double sl_dist = 0;
    if(type == POSITION_TYPE_BUY && sl > 0) sl_dist = (open - sl) / point;
    if(type == POSITION_TYPE_SELL && sl > 0) sl_dist = (sl - open) / point;
-   if(sl_dist <= 0) sl_dist = 100;
+   if(sl_dist <= 0) return; // без SL не ставим BE/trail «на глаз» в 100 pts
+
    double profit_pts = (type == POSITION_TYPE_BUY) ? (bid - open) / point : (open - ask) / point;
    double r_now = profit_pts / sl_dist;
 
-   if(InpUseBreakEven && r_now >= InpBE_R)
+   if(InpUseBreakEven && held_enough && r_now >= InpBE_R && money >= InpArmLockMoney * 0.5)
      {
       if(type == POSITION_TYPE_BUY)
         {
@@ -1312,7 +1328,7 @@ void ManageOne(const ulong ticket)
         }
      }
 
-   if(InpUseTrailing && r_now >= InpTrailStart_R)
+   if(InpUseTrailing && held_enough && r_now >= InpTrailStart_R && money >= InpArmLockMoney * 0.5)
      {
       double trail_pts = sl_dist * InpTrailATR_Mult * 0.5;
       if(type == POSITION_TYPE_BUY)
@@ -1346,16 +1362,24 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
      {
       g_day_income += deal_pnl;
       g_loss_streak = 0;
+      // Даже +$0.10 не должен вести к реэнтри через 4 секунды
+      string wsym = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+      ulong win_cd = (ulong)MathMax(InpWinCooldownMs, InpFarmCooldownMs);
+      // Крошечный плюс (< 40% лока) = почти лосс по смыслу → длиннее пауза
+      if(deal_pnl < InpMinProfitMoney * 0.40)
+         win_cd = (ulong)MathMax(win_cd, (ulong)InpLossCooldownMs);
+      for(int i = 0; i < g_sym_count; i++)
+         if(g_syms[i] == wsym)
+            g_pause_until_ms[i] = GetTickCount64() + win_cd;
      }
    else
      {
       g_day_expense += (-deal_pnl);
       g_loss_streak++;
-      // После минуса — длинная пауза на символе (сумма важнее частоты)
       string dsym = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
       for(int i = 0; i < g_sym_count; i++)
          if(g_syms[i] == dsym)
-            g_pause_until_ms[i] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 30000);
+            g_pause_until_ms[i] = GetTickCount64() + (ulong)MathMax(InpLossCooldownMs, 60000);
       if(g_loss_streak >= 2)
          PrintFormat("LOSS STREAK %d | приход$=%.2f расход$=%.2f net$=%.2f — ждём cooldown",
                      g_loss_streak, g_day_income, g_day_expense, g_day_pnl);
