@@ -4,8 +4,8 @@
 //|  Expectancy (Tharp) + MTF confluence (Elder) + фильтр SMALL/BIG  |
 //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.95"
-#property description "Вход только в КРУПНЫЙ сетап. Лок крупный, cut меньше лока."
+#property version   "3.96"
+#property description "ВХОД = реальный ордер. Пауза/блок видно на панели. Без тихих отказов."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -26,8 +26,8 @@ input int                  InpMaxPositions = 1;
 input int                  InpBasketOpen = 1;
 input int                  InpMaxTradesDay = 120;
 input bool                 InpFarmLoop = true;
-input int                  InpFarmCooldownMs = 25000;  // реже долбим после лока
-input int                  InpLossCooldownMs = 180000; // 3 мин после −$ : не мстим рынку
+input int                  InpFarmCooldownMs = 8000;   // после успешного входа
+input int                  InpLossCooldownMs = 45000;  // после минуса — короткий cooldown
 input bool                 InpRefillBasket = false;
 
 input group "=== Символ ==="
@@ -54,6 +54,7 @@ input double               InpBE_OffsetPts = 2.0;
 input bool                 InpUseTrailing = true;
 input double               InpTrailStart_R = 0.6;
 input double               InpTrailATR_Mult = 0.6;
+input bool                 InpSendStopsAtOpen = false; // false = рынок без SL/TP (лок/кат сам EA)
 
 input group "=== Анализ ==="
 input ENUM_TIMEFRAMES      InpTrendTF   = PERIOD_H1;
@@ -80,7 +81,7 @@ input double               InpMaxLossMoney = 40.0;
 input bool                 InpMaxLossPct = false;
 input double               InpMaxLossPercent = 5.0;
 input bool                 InpPauseIfExpenseLeads = true;
-input double               InpExpenseLeadBuffer = 8.0;
+input double               InpExpenseLeadBuffer = 20.0; // пауза только если net уже ≤ −buffer
 
 #define MAX_SYMS 8
 
@@ -112,8 +113,10 @@ bool   g_signal_enter[MAX_SYMS];
 double g_expected_usd[MAX_SYMS];
 int    g_opp_size[MAX_SYMS];       // OPP_SMALL/MID/BIG
 int    g_align_score[MAX_SYMS];
+string g_block_reason[MAX_SYMS];   // почему нет ордера при сигнале
 ulong  g_last_pulse_ms = 0;
 ulong  g_last_signal_print_ms = 0;
+ulong  g_last_block_print_ms = 0;
 
 datetime g_day_start = 0;
 double   g_day_pnl = 0.0;
@@ -281,6 +284,7 @@ int OnInit()
       g_expected_usd[i] = 0;
       g_opp_size[i] = OPP_SMALL;
       g_align_score[i] = 0;
+      g_block_reason[i] = "";
       if(g_ema_fast[i] == INVALID_HANDLE || g_ema_slow[i] == INVALID_HANDLE || g_atr[i] == INVALID_HANDLE)
         {
          PrintFormat("Индикаторы не созданы для %s", g_syms[i]);
@@ -301,10 +305,11 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.95 BIG | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f cut=$%.2f grace=%ds | onlyBIG=%s conf>=%.0f",
+   PrintFormat("ProfitScalper v3.96 EXEC | chart=%s | lot=%.2f | lock$=%.2f/%.2f | panic=$%.2f cut=$%.2f | onlyBIG=%s conf>=%.0f | stopsAtOpen=%s",
                _Symbol, InpLot, InpMinProfitMoney, InpBigProfitMoney,
-               InpPanicCutMoney, InpBasketCutLoss, InpCutGraceSec,
-               InpOnlyBigOpportunity ? "YES" : "no", InpMinEnterConf);
+               InpPanicCutMoney, InpBasketCutLoss,
+               InpOnlyBigOpportunity ? "YES" : "no", InpMinEnterConf,
+               InpSendStopsAtOpen ? "yes" : "no");
    g_last_pulse_ms = 0;
    g_last_signal_print_ms = 0;
    RefreshAllSignals();
@@ -465,13 +470,25 @@ void DrawSignalOnChart()
    // Компактная панель СВЕРХУ СПРАВА — не лезет на one-click и не дублирует Comment
    int y = 18;
    HudLabel("PS_HUD0", y, 11, "Segoe UI Semibold", clrWhite,
-            "ProfitScalper  ·  v3.95");
+            "ProfitScalper  ·  v3.96");
    y += 20;
    HudLabel("PS_HUD1", y, 9, "Consolas", C'130,140,155',
             "────────────────────────");
    y += 18;
-   HudLabel("PS_HUD2", y, 14, "Segoe UI Semibold", clr_sig,
-            StringFormat("%s   %s  %.0f%%", status, side, g_conf[i]));
+
+   // Если сигнал ВХОД, но ордера нет — показываем правду, не врут
+   string head = StringFormat("%s   %s  %.0f%%", status, side, g_conf[i]);
+   if(g_signal_enter[i] && open_n <= 0 && g_block_reason[i] != "")
+     {
+      head = "СИГНАЛ ЕСТЬ · НЕТ ОРДЕРА";
+      clr_sig = clrGold;
+     }
+   if(g_trading_paused)
+     {
+      head = "ПАУЗА ДНЯ";
+      clr_sig = clrOrange;
+     }
+   HudLabel("PS_HUD2", y, 14, "Segoe UI Semibold", clr_sig, head);
    y += 22;
    HudLabel("PS_HUD3", y, 10, "Consolas", clrSilver,
             StringFormat("%s   ~$%.0f   align %d/5", opp, g_expected_usd[i], g_align_score[i]));
@@ -489,10 +506,16 @@ void DrawSignalOnChart()
    HudLabel("PS_HUD7", y, 9, "Consolas", clrSilver,
             StringFormat("приход $%.2f   расход $%.2f", g_day_income, g_day_expense));
    y += 16;
-   HudLabel("PS_HUD8", y, 9, "Consolas", C'160,170,180',
-            StringFormat("поз %d   lot %.2f   lock $%.0f   %s",
-                         open_n, InpLot, g_lock_target[i],
-                         g_signal_enter[i] ? "по сигналу" : "ждём КРУПНЫЙ"));
+   string foot = StringFormat("поз %d   lot %.2f   lock $%.0f",
+                              open_n, InpLot, g_lock_target[i]);
+   if(g_block_reason[i] != "")
+      foot = g_block_reason[i];
+   else if(g_signal_enter[i])
+      foot += "   по сигналу";
+   else
+      foot += "   ждём КРУПНЫЙ";
+   HudLabel("PS_HUD8", y, 9, "Consolas",
+            (g_block_reason[i] != "" ? clrGold : C'160,170,180'), foot);
 
    ChartRedraw(0);
   }
@@ -503,49 +526,32 @@ void OnTimer()
    ResetDayIfNeeded();
    RefreshAllSignals();
    PulseAlive();
-   UpdatePanel();
+   g_trading_paused = DayRiskHit();
    ManageOpenRisk();
-
-   if(DayRiskHit())
-     {
-      if(!g_trading_paused)
-         PrintFormat("Пауза новых входов | net$=%.2f приход$=%.2f расход$=%.2f (LOCK открытых продолжает)",
-                     g_day_pnl, g_day_income, g_day_expense);
-      g_trading_paused = true;
-      return;
-     }
-   g_trading_paused = false;
 
    if(InpFarmLoop && g_trades_today < InpMaxTradesDay)
      {
       for(int i = 0; i < g_sym_count; i++)
          FarmSymbol(i);
      }
+   UpdatePanel(); // HUD после попытки входа — виден BLOCK
   }
 
 //+------------------------------------------------------------------+
 void OnTick()
   {
    ResetDayIfNeeded();
-   RefreshAllSignals(); // сигнал сразу на тике
+   RefreshAllSignals();
    PulseAlive();
-   UpdatePanel();
+   g_trading_paused = DayRiskHit();
    ManageOpenRisk();
 
-   if(DayRiskHit())
+   if(InpFarmLoop)
      {
-      g_trading_paused = true;
-      return;
+      for(int i = 0; i < g_sym_count; i++)
+         FarmSymbol(i);
      }
-   g_trading_paused = false;
-
-   if(g_trades_today >= InpMaxTradesDay)
-      return;
-   if(!InpFarmLoop)
-      return;
-
-   for(int i = 0; i < g_sym_count; i++)
-      FarmSymbol(i);
+   UpdatePanel();
   }
 
 //+------------------------------------------------------------------+
@@ -558,40 +564,74 @@ void ManageOpenRisk()
   }
 
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+void LogBlock(const int idx, const string why)
+  {
+   g_block_reason[idx] = why;
+   if(g_last_block_print_ms > 0 &&
+      (GetTickCount64() - g_last_block_print_ms) < 3000)
+      return;
+   g_last_block_print_ms = GetTickCount64();
+   PrintFormat("BLOCK %s | %s | signal=%s", g_syms[idx], why, g_signal_txt[idx]);
+  }
+
+//+------------------------------------------------------------------+
+bool BrokerTradeOk(string &why)
+  {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+     { why = "терминал: торговля OFF"; return false; }
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+     { why = "Алготорговля OFF (кнопка сверху)"; return false; }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+     { why = "счёт запретил торговлю"; return false; }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+     { why = "счёт запретил советников"; return false; }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
 void FarmSymbol(const int idx)
   {
    const string sym = g_syms[idx];
    int open_now = CountOurPositions(sym);
+   g_block_reason[idx] = "";
+
+   if(DayRiskHit())
+     {
+      LogBlock(idx, StringFormat("пауза дня net$=%.2f расход$=%.2f", g_day_pnl, g_day_expense));
+      return;
+     }
+
+   string why_broker = "";
+   if(!BrokerTradeOk(why_broker))
+     {
+      LogBlock(idx, why_broker);
+      return;
+     }
+
+   if(g_trades_today >= InpMaxTradesDay)
+     {
+      LogBlock(idx, "лимит сделок за день");
+      return;
+     }
 
    MarketScore score;
    if(!AnalyzeSymbol(idx, score))
      {
-      if(g_last_skip_ms[idx] == 0 ||
-         (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
-        {
-         g_last_skip_ms[idx] = GetTickCount64();
-         PrintFormat("SKIP analyze %s (нет котировок/индикаторов)", sym);
-        }
+      LogBlock(idx, "нет котировок/индикаторов");
       return;
      }
 
    ENUM_ORDER_TYPE type = (g_pred_side[idx] == "DOWN/SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   string reason = StringFormat("%s | BIG-only conf=%.0f expect$=%.0f lock$=%.2f align=%d | %s",
+   string reason = StringFormat("%s | BIG conf=%.0f expect$=%.0f lock$=%.2f align=%d",
                                 g_signal_txt[idx], g_conf[idx], g_expected_usd[idx],
-                                g_lock_target[idx], g_align_score[idx], g_analysis[idx]);
+                                g_lock_target[idx], g_align_score[idx]);
    bool can_trade = g_signal_enter[idx];
 
-   // Доп. фильтр expectancy: не входим, если ожидаемый ход < цели лока
    if(can_trade && g_expected_usd[idx] < InpMinProfitMoney * 0.90)
      {
+      LogBlock(idx, StringFormat("expect$=%.0f < lock$=%.2f", g_expected_usd[idx], InpMinProfitMoney));
       can_trade = false;
-      if(g_last_skip_ms[idx] == 0 ||
-         (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
-        {
-         g_last_skip_ms[idx] = GetTickCount64();
-         PrintFormat("SKIP small-expect %s: expect$=%.0f < lock$=%.2f",
-                     sym, g_expected_usd[idx], InpMinProfitMoney);
-        }
      }
 
    if(InpDirection == DIR_BUY)
@@ -599,7 +639,6 @@ void FarmSymbol(const int idx)
    else if(InpDirection == DIR_SELL)
      { type = ORDER_TYPE_SELL; can_trade = true; reason = "fixed SELL"; }
 
-   // Не доливаем против текущего потока (и против уже открытой стороны)
    if(open_now > 0 && can_trade)
      {
       int our = -1;
@@ -617,27 +656,46 @@ void FarmSymbol(const int idx)
          bool mismatch = ((our == POSITION_TYPE_BUY && type == ORDER_TYPE_SELL) ||
                           (our == POSITION_TYPE_SELL && type == ORDER_TYPE_BUY));
          if(mismatch)
+           {
+            LogBlock(idx, "уже открыта противная сторона");
             return;
+           }
         }
      }
 
-   if(!InpRefillBasket)
+   if(!InpRefillBasket && open_now > 0)
      {
-      if(open_now > 0)
-         return;
-     }
-   else if(open_now >= InpMaxPositions)
+      g_block_reason[idx] = ""; // норма: уже в рынке
       return;
+     }
+   if(open_now >= InpMaxPositions)
+     {
+      g_block_reason[idx] = "";
+      return;
+     }
 
    if(!can_trade)
+     {
+      // Не спамим BLOCK когда просто ждём сигнал
+      g_block_reason[idx] = (StringFind(g_signal_txt[idx], "ВХОД") >= 0)
+                            ? "фильтр can_trade=false"
+                            : "";
       return;
+     }
 
    if(g_pause_until_ms[idx] > 0 && GetTickCount64() < g_pause_until_ms[idx])
+     {
+      ulong left = (g_pause_until_ms[idx] - GetTickCount64()) / 1000;
+      LogBlock(idx, StringFormat("cooldown после лосса %lluс", left));
       return;
+     }
 
    if(g_last_farm_ms[idx] > 0 &&
       (GetTickCount64() - g_last_farm_ms[idx]) < (ulong)MathMax(InpFarmCooldownMs, 50))
+     {
+      // короткий кулдаун после своего же входа — не ошибка
       return;
+     }
 
    if(InpUseSpreadFilter)
      {
@@ -646,20 +704,21 @@ void FarmSymbol(const int idx)
          max_spread = MathMax(max_spread, 800);
       if(score.spread_pts > (double)max_spread)
         {
-         if(g_last_skip_ms[idx] == 0 ||
-            (GetTickCount64() - g_last_skip_ms[idx]) >= 10000)
-           {
-            g_last_skip_ms[idx] = GetTickCount64();
-            PrintFormat("SKIP spread %s: %.0f > %d", sym, score.spread_pts, max_spread);
-           }
+         LogBlock(idx, StringFormat("спред %.0f > %d", score.spread_pts, max_spread));
          return;
         }
+     }
+
+   long trade_mode = SymbolInfoInteger(sym, SYMBOL_TRADE_MODE);
+   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
+     {
+      LogBlock(idx, "символ: торговля отключена");
+      return;
      }
 
    int basket = MathMin(InpBasketOpen, InpMaxPositions);
    if(!g_pred_strong[idx])
       basket = 1;
-
    int need = MathMin(basket, InpMaxPositions - open_now);
    if(need <= 0)
       return;
@@ -674,9 +733,15 @@ void FarmSymbol(const int idx)
       g_last_dir[idx] = type;
       g_have_dir[idx] = true;
       g_wait_why[idx] = "";
+      g_block_reason[idx] = "";
       PrintFormat("FARM %s: +%d %s (open=%d/%d) lot=%.2f", sym, opened,
                   type == ORDER_TYPE_BUY ? "BUY" : "SELL",
                   open_now + opened, InpMaxPositions, LotForSymbol(sym));
+     }
+   else
+     {
+      LogBlock(idx, StringFormat("ордер отклонён ret=%d %s",
+                                 trade.ResultRetcode(), trade.ResultRetcodeDescription()));
      }
   }
 
@@ -950,16 +1015,45 @@ void ProtectAgainstFlow(const int idx)
   }
 
 //+------------------------------------------------------------------+
+bool TrySendMarket(const string sym, const ENUM_ORDER_TYPE type, const double lot,
+                   const double sl, const double tp, const string comment)
+  {
+   // Перебор filling — иначе на демо/разных символах ордер молча не проходит
+   ENUM_ORDER_TYPE_FILLING fills[3];
+   fills[0] = ORDER_FILLING_IOC;
+   fills[1] = ORDER_FILLING_FOK;
+   fills[2] = ORDER_FILLING_RETURN;
+   long allowed = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+
+   for(int i = 0; i < 3; i++)
+     {
+      ENUM_ORDER_TYPE_FILLING f = fills[i];
+      bool ok_mode = false;
+      if(f == ORDER_FILLING_FOK && (allowed & SYMBOL_FILLING_FOK) != 0) ok_mode = true;
+      if(f == ORDER_FILLING_IOC && (allowed & SYMBOL_FILLING_IOC) != 0) ok_mode = true;
+      if(f == ORDER_FILLING_RETURN) ok_mode = true; // часто работает даже если флаги странные
+      if(!ok_mode && i < 2) continue;
+
+      trade.SetTypeFilling(f);
+      bool ok = (type == ORDER_TYPE_BUY)
+                ? trade.Buy(lot, sym, 0.0, sl, tp, comment)
+                : trade.Sell(lot, sym, 0.0, sl, tp, comment);
+      if(ok) return true;
+      PrintFormat("OPEN try fill=%d ret=%d %s", (int)f, trade.ResultRetcode(),
+                  trade.ResultRetcodeDescription());
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
 bool OpenTrade(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &s, const string reason)
   {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
-     { Print("OPEN deny: Terminal trade OFF"); return false; }
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-     { Print("OPEN deny: EA AutoTrading OFF (кнопка Алготорговля)"); return false; }
-   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
-     { Print("OPEN deny: Account trade OFF"); return false; }
+   string why = "";
+   if(!BrokerTradeOk(why))
+     { Print("OPEN deny: ", why); return false; }
 
-   trade.SetTypeFillingBySymbol(sym);
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpDeviation);
 
    int idx = 0;
    for(int i = 0; i < g_sym_count; i++)
@@ -967,29 +1061,32 @@ bool OpenTrade(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &
 
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   int stops_level = (int)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
    double sl_pts = MathMax(s.atr_pts * InpATR_SL_Mult, 30.0);
    sl_pts = MathMax(sl_pts, s.spread_pts * 1.5 + 20.0);
+   sl_pts = MathMax(sl_pts, (double)stops_level + 10.0);
 
-   // Сильный предикт → шире TP (большая прибыль)
    double rr = g_pred_strong[idx] ? InpStrongRR : InpWeakRR;
    double tp_pts = sl_pts * rr;
 
    double sl = 0, tp = 0;
-   if(type == ORDER_TYPE_BUY)
+   if(InpSendStopsAtOpen)
      {
-      double price = SymbolInfoDouble(sym, SYMBOL_ASK);
-      sl = NormalizeDouble(price - sl_pts * point, digits);
-      tp = NormalizeDouble(price + tp_pts * point, digits);
-     }
-   else
-     {
-      double price = SymbolInfoDouble(sym, SYMBOL_BID);
-      sl = NormalizeDouble(price + sl_pts * point, digits);
-      tp = NormalizeDouble(price - tp_pts * point, digits);
+      if(type == ORDER_TYPE_BUY)
+        {
+         double price = SymbolInfoDouble(sym, SYMBOL_ASK);
+         sl = NormalizeDouble(price - sl_pts * point, digits);
+         tp = NormalizeDouble(price + tp_pts * point, digits);
+        }
+      else
+        {
+         double price = SymbolInfoDouble(sym, SYMBOL_BID);
+         sl = NormalizeDouble(price + sl_pts * point, digits);
+         tp = NormalizeDouble(price - tp_pts * point, digits);
+        }
      }
 
    double lot = NormalizeLot(sym, LotForSymbol(sym));
-   // Комментарий виден на телефоне во вкладке Торговля
    string comment = StringFormat("%s %.0f>%.0f",
                                  type == ORDER_TYPE_BUY ? "BUY" : "SELL",
                                  type == ORDER_TYPE_BUY ? g_score_buy[idx] : g_score_sell[idx],
@@ -997,9 +1094,28 @@ bool OpenTrade(const string sym, const ENUM_ORDER_TYPE type, const MarketScore &
    if(StringLen(comment) > 31)
       comment = StringSubstr(comment, 0, 31);
 
-   bool ok = (type == ORDER_TYPE_BUY)
-             ? trade.Buy(lot, sym, 0.0, sl, tp, comment)
-             : trade.Sell(lot, sym, 0.0, sl, tp, comment);
+   // 1) рынок без стопов — надёжнее; лок/кат делает EA
+   bool ok = TrySendMarket(sym, type, lot, 0.0, 0.0, comment);
+   // 2) если попросили стопы или нулевой заход странный — ещё раз со стопами
+   if(!ok && InpSendStopsAtOpen)
+      ok = TrySendMarket(sym, type, lot, sl, tp, comment);
+   else if(!ok)
+     {
+      // fallback: со стопами на случай брокера, требующего SL
+      if(type == ORDER_TYPE_BUY)
+        {
+         double price = SymbolInfoDouble(sym, SYMBOL_ASK);
+         sl = NormalizeDouble(price - sl_pts * point, digits);
+         tp = NormalizeDouble(price + tp_pts * point, digits);
+        }
+      else
+        {
+         double price = SymbolInfoDouble(sym, SYMBOL_BID);
+         sl = NormalizeDouble(price + sl_pts * point, digits);
+         tp = NormalizeDouble(price - tp_pts * point, digits);
+        }
+      ok = TrySendMarket(sym, type, lot, sl, tp, comment);
+     }
 
    if(ok)
       PrintFormat("OPEN %s %s lot=%.2f RR=%.1f lock$=%.2f | %s",
@@ -1260,9 +1376,10 @@ bool DayRiskHit()
       double lim = g_day_start_balance * InpMaxLossPercent / 100.0;
       if(g_day_pnl <= -lim) return true;
      }
-   // Расход уже заметно больше прихода — только новые входы стоп
-   if(InpPauseIfExpenseLeads && g_day_expense > 0.0 &&
-      g_day_expense > g_day_income + InpExpenseLeadBuffer && g_trades_today >= 4)
+   // Пауза только когда net уже ушёл в минус на buffer — НЕ блокируем при ВХОД просто из-за счётчика trades
+   if(InpPauseIfExpenseLeads &&
+      g_day_pnl <= -MathAbs(InpExpenseLeadBuffer) &&
+      g_day_expense > g_day_income + 1.0)
       return true;
    return false;
   }
