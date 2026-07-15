@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.83 — направление по свечам M5/M15/H1, не по микро-пипу M1    |
+  //|  v3.84 — красные H1+M5+M15 → SELL (даже если M1 дёргается вверх)  |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.83"
-#property description "Не покупает в красные свечи. H1/M5/M15 решают направление."
+#property version   "3.84"
+#property description "Свечи H1/M5/M15. Красные → SELL/ждём. Не покупает против свечей."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -268,7 +268,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.83 CANDLES | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
+   PrintFormat("ProfitScalper v3.84 CANDLES | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
                _Symbol, InpLot, InpMinProfitMoney,
                InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss);
    return INIT_SUCCEEDED;
@@ -904,7 +904,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.83 — свечи M5/M15/H1 решают\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nКрасные свечи → не BUY. Зелёные → не SELL.",
+              "ProfitScalper v3.84 — свечи H1/M5/M15\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nВсе красные → SELL. Все зелёные → BUY. Иначе ждём.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
