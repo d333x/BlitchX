@@ -106,7 +106,9 @@ MarketFlow ReadMarketFlow(const string sym)
    double m1_fast = Pts(sym, CloseSlope(sym, PERIOD_M1, 3)); // короткий импульс
 
    VoteSlope(f.m1_pts, thr_m1, f.buy_v, f.sell_v, f.reason, "M1");
-   VoteSlope(m1_fast, thr_m1 * 0.55, f.buy_v, f.sell_v, f.reason, "M1f");
+   // M1f не голосует (короткий шум ломал вход) — только soft-veto ниже
+   if(m1_fast >= thr_m1 * 0.55) f.reason += "M1f↑ ";
+   else if(m1_fast <= -thr_m1 * 0.55) f.reason += "M1f↓ ";
    VoteSlope(f.m5_pts, thr_m5, f.buy_v, f.sell_v, f.reason, "M5");
    VoteSlope(m15_pts, thr_m15, f.buy_v, f.sell_v, f.reason, "M15");
 
@@ -142,14 +144,15 @@ MarketFlow ReadMarketFlow(const string sym)
 
    f.reason += StringFormat("|M1=%.0f M5=%.0f thr1=%.0f", f.m1_pts, f.m5_pts, thr_m1);
 
-   // M1f veto только если ЯВНО против (мелкий отскок не блокирует)
-   const double veto = thr_m1 * 0.75;
-   const bool m1f_vs_buy  = (m1_fast <= -veto);
-   const bool m1f_vs_sell = (m1_fast >=  veto);
-   const bool m1_up = (f.m1_pts >= thr_m1 * 0.35);
-   const bool m1_dn = (f.m1_pts <= -thr_m1 * 0.35);
-   const bool strong_m1_up = (f.m1_pts >= thr_m1 * 1.2);
-   const bool strong_m1_dn = (f.m1_pts <= -thr_m1 * 1.2);
+   // Soft-veto: короткий импульс блокирует только если сам сильный
+   // И сопоставим с M1 (мелкий отскок на фоне большого хода — игнор)
+   const double veto = thr_m1 * 1.0;
+   const bool m1f_vs_buy  = (m1_fast <= -veto && MathAbs(m1_fast) >= MathAbs(f.m1_pts) * 0.55);
+   const bool m1f_vs_sell = (m1_fast >=  veto && MathAbs(m1_fast) >= MathAbs(f.m1_pts) * 0.55);
+   const bool m1_up = (f.m1_pts >= thr_m1 * 0.25);
+   const bool m1_dn = (f.m1_pts <= -thr_m1 * 0.25);
+   const bool strong_m1_up = (f.m1_pts >= thr_m1 * 0.9);
+   const bool strong_m1_dn = (f.m1_pts <= -thr_m1 * 0.9);
 
    // Путь A: перевес голосов + M1 в ту же сторону
    if(f.buy_v >= f.sell_v + 1 && m1_up && !m1f_vs_buy && f.buy_v >= 2)

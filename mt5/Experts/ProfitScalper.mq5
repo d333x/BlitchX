@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.81 — быстрее вход: сильный M1 + мягкий clear-flow             |
+  //|  v3.82 — вход по M1/M5: короткий шум M1f больше не стопит сделку   |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.81"
-#property description "Живой ход M1/M5. Сильный импульс → вход. Полный чоп → ждёт."
+#property version   "3.82"
+#property description "Живой ход M1/M5. Сильный импульс → вход. Мелкий отскок не блокирует."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -268,7 +268,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.81 FLOW | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
+   PrintFormat("ProfitScalper v3.82 FLOW | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f",
                _Symbol, InpLot, InpMinProfitMoney,
                InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss);
    return INIT_SUCCEEDED;
@@ -908,7 +908,7 @@ void UpdatePanel()
                  g_score_why[i], wait);
      }
    Comment(StringFormat(
-              "ProfitScalper v3.81 — куда идёт рынок СЕЙЧАС\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nСильный M1 → вход. Только полный чоп → ждём.",
+              "ProfitScalper v3.82 — куда идёт рынок СЕЙЧАС\n%s\n————\ndayPnL %.2f | trades %d | lot %.2f | pause %s\nСильный M1 → вход. Мелкий отскок не стопит.",
               list, g_day_pnl, g_trades_today, InpLot,
               g_trading_paused ? "YES" : "no"));
   }
