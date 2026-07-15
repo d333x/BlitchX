@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               ProfitScalper.mq5  |
-  //|  v3.86 — Analyze больше не стопорит вход при мёртвых индикаторах   |
+  //|  v3.87 — не резать SELL при красном H1 из‑за зелёных M5/M15         |
  //+------------------------------------------------------------------+
 #property copyright "ProfitScalper"
-#property version   "3.86"
-#property description "Автофарм: не блокируется пустыми EMA. Пульс 10с. H1 ведёт."
+#property version   "3.87"
+#property description "Автофарм: держит корзину по H1, не режет из-за шума M5/M15."
 
 #include <Trade/Trade.mqh>
 #include "../Include/ChartKnowledge.mqh"
@@ -269,7 +269,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(ms))
       Print("Timer fail — LOCK только на тиках графика");
 
-   PrintFormat("ProfitScalper v3.86 LIVE | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f | dayCap=$%.0f",
+   PrintFormat("ProfitScalper v3.87 LIVE | chart=%s | lot=%.2f | min$=%.2f | clearFlow=%s | cut=$%.1f | dayCap=$%.0f",
                _Symbol, InpLot, InpMinProfitMoney,
                InpRequireClearFlow ? "ON" : "off", InpBasketCutLoss, InpMaxLossMoney);
    g_last_pulse_ms = 0;
@@ -696,25 +696,21 @@ void ProtectAgainstFlow(const int idx)
    bool against = ((our == POSITION_TYPE_BUY && flow.dir == ORDER_TYPE_SELL) ||
                    (our == POSITION_TYPE_SELL && flow.dir == ORDER_TYPE_BUY));
 
-   // Красные H1/M5 при BUY (и наоборот) — закрываем, даже если clear ещё нет
+   // Режем только если H1 развернулся против нашей стороны (не из-за шума M5/M15)
    bool candles_vs =
-      (our == POSITION_TYPE_BUY  && (StringFind(flow.reason, "H1now↓") >= 0 ||
-                                     (StringFind(flow.reason, "M5now↓") >= 0 &&
-                                      StringFind(flow.reason, "M15now↓") >= 0))) ||
-      (our == POSITION_TYPE_SELL && (StringFind(flow.reason, "H1now↑") >= 0 ||
-                                     (StringFind(flow.reason, "M5now↑") >= 0 &&
-                                      StringFind(flow.reason, "M15now↑") >= 0)));
+      (our == POSITION_TYPE_BUY  && StringFind(flow.reason, "H1now↓") >= 0) ||
+      (our == POSITION_TYPE_SELL && StringFind(flow.reason, "H1now↑") >= 0);
 
    if(!InpCloseAgainstFlow)
       return;
 
+   // Поток против нас — только при clear; свечи H1 — всегда
+   if(against && !flow.clear && !candles_vs)
+      return;
    if(!against && !candles_vs)
       return;
 
-   if(!flow.clear && !candles_vs)
-      return;
-
-   if(candles_vs || basket < -1.0 || MathAbs(flow.m1_pts) >= 80.0)
+   if(candles_vs || (against && flow.clear && (basket < -1.0 || MathAbs(flow.m1_pts) >= 80.0)))
      {
       CloseOurSymbol(sym, StringFormat(
          "против свечей/потока %s B%d/S%d M1=%.0f basket=$%.2f | %s",
