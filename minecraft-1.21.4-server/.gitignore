@@ -1,0 +1,31 @@
+# Server binary (download with setup script)
+server.jar
+
+# Runtime / world data
+world/
+world_nether/
+world_the_end/
+logs/
+crash-reports/
+libraries/
+versions/
+cache/
+
+# Player / ops data
+usercache.json
+usernamecache.json
+ops.json
+whitelist.json
+banned-players.json
+banned-ips.json
+banned-ips.txt
+banned-players.txt
+ops.txt
+white-list.txt
+
+# Session / misc
+session.lock
+*.log
+*.tmp
+*.jar.bak
+.console_history

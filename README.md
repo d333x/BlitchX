@@ -1,6 +1,10 @@
 # BlitchX
 BlitchX like in Mr.Robot
 
+## Minecraft 1.21.4 Server
+
+Vanilla Java Edition server setup lives in [`minecraft-1.21.4-server/`](minecraft-1.21.4-server/). See that folder’s README for Windows/Linux start instructions.
+
 ### Полный код и инструкция для **Blitch X** (Linux):
 
 ---
